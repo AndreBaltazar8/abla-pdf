@@ -1,0 +1,1023 @@
+// The document model for generating PDF files: fonts, pages, images, tables and
+// metadata, written out as a file by PdfDocument.toBytes.
+//
+// A page is drawn on its own and handed to the document with addPage, which
+// copies what it needs, so one PdfPage can be cleared and drawn again.
+
+import "abla/bytes"
+import "abla/crypto"
+import "abla/date"
+import "abla/float"
+import "abla/math"
+import "abla/text"
+
+val pdfA4Width = 595.276
+val pdfA4Height = 841.89
+val pdfLetterWidth = 612.0
+val pdfLetterHeight = 792.0
+
+val pdfAlignLeft = 0
+val pdfAlignCenter = 1
+val pdfAlignRight = 2
+
+private fun winAnsiFromUnicode(): Map<int, int> {
+    val table = Map<int, int>()
+    for (code in 32 until 256) {
+        val unused = code == 0x7f || code == 0x81 || code == 0x8d || code == 0x8f || code == 0x90 || code == 0x9d
+        if (!unused) {
+            val cp = PDF_ENCODING_WINANSI[code]
+            if (!table.has(cp)) table.set(cp, code)
+        }
+    }
+    table.set(0xa0, 32)
+    table.set(0xad, 45)
+    table
+}
+
+private val WINANSI_REVERSE = winAnsiFromUnicode()
+
+// Combining sequences written as base letter plus mark, as text from some
+// systems arrives, become the single character the fonts have.
+private fun composeTable(): Map<int, int> {
+    val table = Map<int, int>()
+    val rows = [
+        [0x300, 65, 0xc0, 69, 0xc8, 73, 0xcc, 79, 0xd2, 85, 0xd9, 97, 0xe0, 101, 0xe8, 105, 0xec, 111, 0xf2, 117, 0xf9],
+        [0x301, 65, 0xc1, 69, 0xc9, 73, 0xcd, 79, 0xd3, 85, 0xda, 89, 0xdd, 97, 0xe1, 101, 0xe9, 105, 0xed, 111, 0xf3, 117, 0xfa, 121, 0xfd],
+        [0x302, 65, 0xc2, 69, 0xca, 73, 0xce, 79, 0xd4, 85, 0xdb, 97, 0xe2, 101, 0xea, 105, 0xee, 111, 0xf4, 117, 0xfb],
+        [0x303, 65, 0xc3, 78, 0xd1, 79, 0xd5, 97, 0xe3, 110, 0xf1, 111, 0xf5],
+        [0x308, 65, 0xc4, 69, 0xcb, 73, 0xcf, 79, 0xd6, 85, 0xdc, 97, 0xe4, 101, 0xeb, 105, 0xef, 111, 0xf6, 117, 0xfc, 121, 0xff],
+        [0x327, 67, 0xc7, 99, 0xe7]
+    ]
+    for (row in rows) {
+        var i = 1
+        while (i + 1 < row.size) {
+            table.set(row[0] * 256 + row[i], row[i + 1])
+            i = i + 2
+        }
+    }
+    table
+}
+
+private val COMPOSE = composeTable()
+
+// The code points of `text` with the combining sequences above composed.
+fun pdfTextCodePoints(text: string): array<int> {
+    val cps = pdfUtf8Decode(text)
+    val out: array<int> = []
+    for (cp in cps) {
+        val last = out.size - 1
+        val composed = if (cp >= 0x300 && cp <= 0x327 && last >= 0 && out[last] < 128) COMPOSE.get(cp * 256 + out[last]) else null
+        if (composed != null) out[last] = composed
+        else out.append(cp)
+    }
+    out
+}
+
+// A font ready to use on pages. The handle holds metrics only; the document keeps
+// track of which glyphs are used.
+class PdfFont(
+    val id: int,
+    val name: string,
+    val ok: bool,
+    val error: string,
+    val truetype: PdfTrueType?,
+    val widths: array<int>
+) {
+    // The width of a code point in thousandths of the font size.
+    fun codeWidth(cp: int): int {
+        val t = truetype
+        if (t != null) return t.advance(t.glyphFor(cp)) * 1000 / t.unitsPerEm
+        val code = WINANSI_REVERSE.get(cp) ?? 63
+        widths[code]
+    }
+
+    fun textWidth(text: string, size: f64): f64 {
+        var total = 0
+        for (cp in pdfTextCodePoints(text)) total = total + codeWidth(cp)
+        f64FromInt(total) * size / 1000.0
+    }
+
+    // Height above the baseline, as a fraction of the font size.
+    fun ascent(): f64 {
+        val t = truetype
+        if (t != null) return f64FromInt(t.ascent) / f64FromInt(t.unitsPerEm)
+        0.75
+    }
+
+    // Depth below the baseline, as a negative fraction of the font size.
+    fun descent(): f64 {
+        val t = truetype
+        if (t != null) return f64FromInt(t.descent) / f64FromInt(t.unitsPerEm)
+        -0.22
+    }
+
+    // Whether the font can show this character.
+    fun hasGlyph(cp: int): bool {
+        val t = truetype
+        if (t != null) return t.glyphFor(cp) != 0
+        WINANSI_REVERSE.has(cp)
+    }
+}
+
+// An image added to a document.
+class PdfImage(val id: int, val width: int, val height: int, val ok: bool, val error: string)
+
+private val COURIER_WIDTHS = filledArray(256, 600)
+
+private fun standardWidths(name: string): array<int> {
+    if (name == "Helvetica" || name == "Helvetica-Oblique") return PDF_WIDTHS_HELVETICA
+    if (name == "Helvetica-Bold" || name == "Helvetica-BoldOblique") return PDF_WIDTHS_HELVETICA_BOLD
+    if (name == "Times-Roman") return PDF_WIDTHS_TIMES_ROMAN
+    if (name == "Times-Bold") return PDF_WIDTHS_TIMES_BOLD
+    if (name == "Times-Italic") return PDF_WIDTHS_TIMES_ITALIC
+    if (name == "Times-BoldItalic") return PDF_WIDTHS_TIMES_BOLDITALIC
+    COURIER_WIDTHS
+}
+
+private fun standardFontKnown(name: string): bool = when (name) {
+    "Helvetica", "Helvetica-Oblique", "Helvetica-Bold", "Helvetica-BoldOblique",
+    "Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic",
+    "Courier", "Courier-Bold", "Courier-Oblique", "Courier-BoldOblique" -> true
+    else -> false
+}
+
+// A page being drawn. Coordinates are points from the bottom left corner.
+class PdfPage(
+    var width: f64 = pdfA4Width,
+    var height: f64 = pdfA4Height,
+    val pieces: array<string> = array<string>(),
+    val pieceFont: array<int> = array<int>(),
+    val fontIds: array<int> = array<int>(),
+    val imageIds: array<int> = array<int>(),
+    val opacities: array<string> = array<string>(),
+    val links: array<string> = array<string>(),
+    var usesCmyk: bool = false
+) {
+    fun raw(operators: string): void {
+        pieces.append(operators)
+        pieceFont.append(-1)
+    }
+
+    fun op(operands: array<f64>, name: string): void {
+        val out = byteBuffer()
+        for (v in operands) {
+            out.appendText(pdfNumber(v))
+            out.appendText(" ")
+        }
+        out.appendText(name)
+        out.appendText("\n")
+        raw(out.toText())
+    }
+
+    fun save(): void = raw("q\n")
+    fun restore(): void = raw("Q\n")
+    fun transform(a: f64, b: f64, c: f64, d: f64, e: f64, f: f64): void = op([a, b, c, d, e, f], "cm")
+    fun translate(x: f64, y: f64): void = transform(1.0, 0.0, 0.0, 1.0, x, y)
+    fun scale(x: f64, y: f64): void = transform(x, 0.0, 0.0, y, 0.0, 0.0)
+
+    fun rotate(degrees: f64): void {
+        val r = degrees * mathPi / 180.0
+        transform(cos(r), sin(r), 0.0 - sin(r), cos(r), 0.0, 0.0)
+    }
+
+    // Colours take components from 0 to 1.
+    fun setFillColor(r: f64, g: f64, b: f64): void = op([r, g, b], "rg")
+    fun setStrokeColor(r: f64, g: f64, b: f64): void = op([r, g, b], "RG")
+    fun setFillGray(v: f64): void = op([v], "g")
+    fun setStrokeGray(v: f64): void = op([v], "G")
+    fun setFillCmyk(c: f64, m: f64, y: f64, k: f64): void {
+        usesCmyk = true
+        op([c, m, y, k], "k")
+    }
+    fun setStrokeCmyk(c: f64, m: f64, y: f64, k: f64): void {
+        usesCmyk = true
+        op([c, m, y, k], "K")
+    }
+    fun setFillRgb(rgb: int): void = setFillColor(channel(rgb, 16), channel(rgb, 8), channel(rgb, 0))
+    fun setStrokeRgb(rgb: int): void = setStrokeColor(channel(rgb, 16), channel(rgb, 8), channel(rgb, 0))
+
+    fun channel(rgb: int, shift: int): f64 = f64FromInt((rgb >> shift) & 255) / 255.0
+
+    fun setLineWidth(w: f64): void = op([w], "w")
+    // 0 butt, 1 round, 2 square.
+    fun setLineCap(style: int): void = raw("$style J\n")
+    // 0 miter, 1 round, 2 bevel.
+    fun setLineJoin(style: int): void = raw("$style j\n")
+
+    fun setDash(pattern: array<f64>, phase: f64 = 0.0): void {
+        val out = byteBuffer()
+        out.appendText("[")
+        for (v in pattern) {
+            out.appendText(pdfNumber(v))
+            out.appendText(" ")
+        }
+        out.appendText("] ")
+        out.appendText(pdfNumber(phase))
+        out.appendText(" d\n")
+        raw(out.toText())
+    }
+
+    // Constant opacity from 0 to 1 for later fills and strokes.
+    fun setOpacity(fill: f64, stroke: f64 = fill): void {
+        val entry = "<< /ca ${pdfNumber(fill)} /CA ${pdfNumber(stroke)} >>"
+        var index = -1
+        for (i in 0 until opacities.size) if (opacities[i] == entry) index = i
+        if (index < 0) {
+            index = opacities.size
+            opacities.append(entry)
+        }
+        raw("/GS$index gs\n")
+    }
+
+    fun moveTo(x: f64, y: f64): void = op([x, y], "m")
+    fun lineTo(x: f64, y: f64): void = op([x, y], "l")
+    fun curveTo(x1: f64, y1: f64, x2: f64, y2: f64, x3: f64, y3: f64): void = op([x1, y1, x2, y2, x3, y3], "c")
+    fun closePath(): void = raw("h\n")
+    fun rect(x: f64, y: f64, w: f64, h: f64): void = op([x, y, w, h], "re")
+
+    fun ellipse(cx: f64, cy: f64, rx: f64, ry: f64): void {
+        val k = 0.5522847498
+        moveTo(cx + rx, cy)
+        curveTo(cx + rx, cy + k * ry, cx + k * rx, cy + ry, cx, cy + ry)
+        curveTo(cx - k * rx, cy + ry, cx - rx, cy + k * ry, cx - rx, cy)
+        curveTo(cx - rx, cy - k * ry, cx - k * rx, cy - ry, cx, cy - ry)
+        curveTo(cx + k * rx, cy - ry, cx + rx, cy - k * ry, cx + rx, cy)
+        closePath()
+    }
+
+    fun circle(cx: f64, cy: f64, r: f64): void = ellipse(cx, cy, r, r)
+
+    fun roundedRect(x: f64, y: f64, w: f64, h: f64, r: f64): void {
+        val k = r * 0.4477152502
+        moveTo(x + r, y)
+        lineTo(x + w - r, y)
+        curveTo(x + w - k, y, x + w, y + k, x + w, y + r)
+        lineTo(x + w, y + h - r)
+        curveTo(x + w, y + h - k, x + w - k, y + h, x + w - r, y + h)
+        lineTo(x + r, y + h)
+        curveTo(x + k, y + h, x, y + h - k, x, y + h - r)
+        lineTo(x, y + r)
+        curveTo(x, y + k, x + k, y, x + r, y)
+        closePath()
+    }
+
+    fun stroke(): void = raw("S\n")
+    fun fill(): void = raw("f\n")
+    fun fillEvenOdd(): void = raw("f*\n")
+    fun fillAndStroke(): void = raw("B\n")
+    fun clip(): void = raw("W n\n")
+    fun endPath(): void = raw("n\n")
+
+    fun line(x1: f64, y1: f64, x2: f64, y2: f64): void {
+        moveTo(x1, y1)
+        lineTo(x2, y2)
+        stroke()
+    }
+
+    fun noteFont(font: PdfFont): void {
+        var seen = false
+        for (id in fontIds) if (id == font.id) seen = true
+        if (!seen) fontIds.append(font.id)
+    }
+
+    // One line of UTF-8 text with its baseline starting at (x, y).
+    fun text(font: PdfFont, size: f64, x: f64, y: f64, content: string): void {
+        if (!font.ok) return
+        noteFont(font)
+        raw("BT /F${font.id} ${pdfNumber(size)} Tf ${pdfNumber(x)} ${pdfNumber(y)} Td ")
+        pieces.append(content)
+        pieceFont.append(font.id)
+        raw(" Tj ET\n")
+    }
+
+    // One line aligned about x: left of it, centered on it or right of it.
+    fun textAligned(font: PdfFont, size: f64, x: f64, y: f64, content: string, align: int): void {
+        val w = font.textWidth(content, size)
+        val at = if (align == pdfAlignRight) x - w else if (align == pdfAlignCenter) x - w / 2.0 else x
+        text(font, size, at, y, content)
+    }
+
+    // Text wrapped to `boxWidth`, first baseline at y. Returns the baseline the
+    // next line would have.
+    fun textBox(
+        font: PdfFont, size: f64, x: f64, y: f64, boxWidth: f64, content: string,
+        align: int = 0, leading: f64 = 0.0
+    ): f64 {
+        val step = if (leading > 0.0) leading else size * 1.2
+        var baseline = y
+        for (line in pdfWrapText(font, size, content, boxWidth)) {
+            val anchor = if (align == pdfAlignRight) x + boxWidth else if (align == pdfAlignCenter) x + boxWidth / 2.0 else x
+            textAligned(font, size, anchor, baseline, line, align)
+            baseline = baseline - step
+        }
+        baseline
+    }
+
+    fun image(img: PdfImage, x: f64, y: f64, w: f64, h: f64): void {
+        if (!img.ok) return
+        var seen = false
+        for (id in imageIds) if (id == img.id) seen = true
+        if (!seen) imageIds.append(img.id)
+        raw("q ${pdfNumber(w)} 0 0 ${pdfNumber(h)} ${pdfNumber(x)} ${pdfNumber(y)} cm /Im${img.id} Do Q\n")
+    }
+
+    // A clickable area opening a URI.
+    fun link(x: f64, y: f64, w: f64, h: f64, uri: string): void {
+        links.append(
+            "<< /Type /Annot /Subtype /Link /Rect [${pdfNumber(x)} ${pdfNumber(y)} ${pdfNumber(x + w)} ${pdfNumber(y + h)}] " +
+                "/Border [0 0 0] /F 4 /A << /Type /Action /S /URI /URI ${pdfLiteralString(uri)} >> >>"
+        )
+    }
+
+    // Empties the page so it can be drawn again.
+    fun clear(): void {
+        pieces.clear()
+        pieceFont.clear()
+        fontIds.clear()
+        imageIds.clear()
+        opacities.clear()
+        links.clear()
+        usesCmyk = false
+    }
+}
+
+// Breaks text into lines no wider than maxWidth, at spaces and newlines; a word
+// wider than the whole line is broken between characters.
+fun pdfWrapText(font: PdfFont, size: f64, text: string, maxWidth: f64): array<string> {
+    val limit = maxWidth * 1000.0 / size
+    val lines: array<string> = []
+    var word = byteBuffer()
+    var wordUnits = 0
+    val spaceUnits = font.codeWidth(32)
+    val cps = pdfTextCodePoints(text)
+    var current = ""
+    var currentUnits = 0
+    var i = 0
+    val total = cps.size
+    while (i <= total) {
+        val cp = if (i < total) cps[i] else 10
+        if (cp == 32 || cp == 10) {
+            val w = word.toText()
+            if (w.size > 0) {
+                val extra = if (current.size > 0) spaceUnits else 0
+                if (f64FromInt(currentUnits + extra + wordUnits) <= limit) {
+                    current = if (current.size > 0) current + " " + w else w
+                    currentUnits = currentUnits + extra + wordUnits
+                } else {
+                    if (current.size > 0) lines.append(current)
+                    current = w
+                    currentUnits = wordUnits
+                }
+                word = byteBuffer()
+                wordUnits = 0
+            }
+            if (cp == 10 && (i < total)) {
+                lines.append(current)
+                current = ""
+                currentUnits = 0
+            }
+        } else {
+            val units = font.codeWidth(cp)
+            if (wordUnits > 0 && f64FromInt(wordUnits + units) > limit) {
+                if (current.size > 0) {
+                    lines.append(current)
+                    current = ""
+                    currentUnits = 0
+                }
+                lines.append(word.toText())
+                word = byteBuffer()
+                wordUnits = 0
+            }
+            word.pdfAppendUtf8(cp)
+            wordUnits = wordUnits + units
+        }
+        i = i + 1
+    }
+    if (current.size > 0 || lines.size == 0) lines.append(current)
+    lines
+}
+
+class PdfCell(
+    val text: string,
+    val align: int = 0,
+    val font: PdfFont? = null,
+    val span: int = 1,
+    val fill: int = -1,
+    val color: int = 0
+)
+
+// A table of wrapped text. Drawn by PdfDocument.drawTable, which continues on
+// new pages and repeats the header rows there.
+class PdfTable(
+    val widths: array<f64>,
+    val font: PdfFont,
+    val size: f64 = 10.0,
+    val headerFont: PdfFont? = null,
+    val padding: f64 = 4.0,
+    val borderWidth: f64 = 0.5,
+    val headerRows: int = 0,
+    val headerFill: int = 0xe6e6e6,
+    val rows: array<array<PdfCell>> = array<array<PdfCell>>()
+) {
+    fun row(texts: array<string>): void {
+        val cells: array<PdfCell> = []
+        for (t in texts) cells.append(PdfCell(t))
+        rows.append(cells)
+    }
+
+    fun cells(cells: array<PdfCell>): void {
+        val copy: array<PdfCell> = []
+        for (c in cells) copy.append(PdfCell(c.text, c.align, c.font, c.span, c.fill, c.color))
+        rows.append(copy)
+    }
+}
+
+class PdfStoredFont(
+    val font: PdfFont,
+    val glyphMap: Map<int, int>,
+    val glyphs: array<int>,
+    val unicodes: array<int>
+)
+
+class PdfStoredImage(
+    val width: int,
+    val height: int,
+    val components: int,
+    val samples: string,
+    val alpha: string,
+    val isJpeg: bool,
+    val invertedCmyk: bool
+)
+
+class PdfStoredPage(
+    val width: f64,
+    val height: f64,
+    val content: string,
+    val fontIds: array<int>,
+    val imageIds: array<int>,
+    val opacities: array<string>,
+    val links: array<string>
+)
+
+class ObjectSink(
+    val bodies: array<string>,
+    val streams: array<bool>
+) {
+    fun reserve(): int {
+        bodies.append("")
+        streams.append(false)
+        bodies.size
+    }
+
+    fun set(number: int, body: string): void {
+        bodies[number - 1] = body
+    }
+
+    fun setStream(number: int, entries: string, data: string): void {
+        bodies[number - 1] = "<< $entries /Length ${data.size} >>\nstream\n$data\nendstream"
+        streams[number - 1] = true
+    }
+
+    fun add(body: string): int {
+        val number = reserve()
+        set(number, body)
+        number
+    }
+
+    fun addStream(entries: string, data: string): int {
+        val number = reserve()
+        setStream(number, entries, data)
+        number
+    }
+}
+
+private fun xmlEscape(text: string): string =
+    text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+class PdfDocument(
+    var title: string = "",
+    var author: string = "",
+    var subject: string = "",
+    var keywords: string = "",
+    var creator: string = "",
+    var producer: string = "abla-pdf",
+    // Milliseconds since 1970; -1 leaves the date out, so output is reproducible.
+    var createdAt: int = -1,
+    var modifiedAt: int = -1,
+    var language: string = "",
+    // Compress content, fonts and images.
+    var compress: bool = true,
+    // Pack objects into object streams with a cross-reference stream (PDF 1.5+).
+    var objectStreams: bool = false,
+    // Write PDF/A-2b: embedded fonts only, sRGB output intent, XMP identification.
+    var pdfA: bool = false,
+    val errors: array<string> = array<string>(),
+    val warnings: array<string> = array<string>(),
+    val fonts: array<PdfStoredFont> = array<PdfStoredFont>(),
+    val images: array<PdfStoredImage> = array<PdfStoredImage>(),
+    val pages: array<PdfStoredPage> = array<PdfStoredPage>()
+) {
+    // One of the 14 standard fonts, except Symbol and ZapfDingbats. They hold
+    // Windows-1252 characters and aren't embedded: PDF/A forbids them.
+    fun standardFont(name: string): PdfFont {
+        if (!standardFontKnown(name)) {
+            val reason = "unknown standard font $name"
+            errors.append(reason)
+            return PdfFont(-1, name, false, reason, null, [])
+        }
+        val font = PdfFont(fonts.size, name, true, "", null, standardWidths(name))
+        fonts.append(PdfStoredFont(font, Map<int, int>(), [], []))
+        font
+    }
+
+    // Embeds a TrueType font; only the glyphs used go into the file. Check `ok`.
+    fun embedFont(data: string): PdfFont {
+        val parsed = pdfParseTrueType(data)
+        if (!parsed.ok) {
+            errors.append("font: ${parsed.error}")
+            return PdfFont(-1, "", false, parsed.error, null, [])
+        }
+        if ((parsed.embedding & 15) == 2) {
+            warnings.append("font ${parsed.postScriptName} declares restricted licence embedding")
+        }
+        val font = PdfFont(fonts.size, parsed.postScriptName, true, "", parsed, [])
+        val glyphMap = Map<int, int>()
+        glyphMap.set(0, 0)
+        fonts.append(PdfStoredFont(font, glyphMap, [0], [0]))
+        font
+    }
+
+    fun addImageFile(decoded: PdfDecodedImage): PdfImage {
+        if (!decoded.ok) {
+            errors.append("image: ${decoded.error}")
+            return PdfImage(-1, 0, 0, false, decoded.error)
+        }
+        val id = images.size
+        images.append(PdfStoredImage(
+            decoded.width, decoded.height, decoded.components, decoded.samples,
+            decoded.alpha, decoded.isJpeg, decoded.invertedCmyk
+        ))
+        PdfImage(id, decoded.width, decoded.height, true, "")
+    }
+
+    fun addJpeg(data: string): PdfImage = addImageFile(pdfReadJpeg(data))
+    fun addPng(data: string): PdfImage = addImageFile(pdfDecodePng(data))
+
+    // Raw 8-bit samples, row by row: 1 gray, 3 RGB or 4 CMYK components per pixel,
+    // with an optional 8-bit alpha plane.
+    fun addRawImage(width: int, height: int, components: int, samples: string, alpha: string = ""): PdfImage {
+        var reason = ""
+        if (width <= 0 || height <= 0) reason = "image size must be positive"
+        else if (components != 1 && components != 3 && components != 4) reason = "image components must be 1, 3 or 4"
+        else if (samples.size != width * height * components) reason = "image samples don't match its size"
+        else if (alpha.size != 0 && alpha.size != width * height) reason = "image alpha doesn't match its size"
+        addImageFile(if (reason != "") PdfDecodedImage(false, reason, 0, 0, 0, "", "", false, false)
+            else PdfDecodedImage(true, "", width, height, components, samples, alpha, false, false))
+    }
+
+    fun encodeRun(fontId: int, text: string): string {
+        val stored = fonts[fontId]
+        val font = stored.font
+        val t = font.truetype
+        val cps = pdfTextCodePoints(text)
+        val out = byteBuffer()
+        if (t != null) {
+            out.appendText("<")
+            for (cp in cps) {
+                val glyph = t.glyphFor(cp)
+                if (glyph == 0) noteMissing(font.name, cp)
+                val known = stored.glyphMap.get(glyph)
+                var index = 0
+                if (known != null) index = known
+                else {
+                    index = stored.glyphs.size
+                    stored.glyphMap.set(glyph, index)
+                    stored.glyphs.append(glyph)
+                    stored.unicodes.append(cp)
+                }
+                out.appendText(pdfHexU16(index))
+            }
+            out.appendText(">")
+            return out.toText()
+        }
+        for (cp in cps) {
+            val code = WINANSI_REVERSE.get(cp)
+            if (code == null) {
+                noteMissing(font.name, cp)
+                out.appendByteValue(63)
+            } else out.appendByteValue(code)
+        }
+        pdfLiteralString(out.toText())
+    }
+
+    fun noteMissing(fontName: string, cp: int): void {
+        val message = "font $fontName has no glyph for U+${pdfHexU16(cp)}"
+        for (w in warnings) if (w == message) return
+        warnings.append(message)
+        if (pdfA) errors.append(message)
+    }
+
+    // Finishes a page: its current content becomes the next page of the document.
+    // The PdfPage stays as it is; `clear` it to draw another.
+    fun addPage(page: PdfPage): void {
+        val content = byteBuffer()
+        for (i in 0 until page.pieces.size) {
+            val id = page.pieceFont[i]
+            if (id < 0) content.appendText(page.pieces[i])
+            else content.appendText(encodeRun(id, page.pieces[i]))
+        }
+        val fontIds: array<int> = []
+        for (id in page.fontIds) fontIds.append(id)
+        val imageIds: array<int> = []
+        for (id in page.imageIds) imageIds.append(id)
+        val opacities: array<string> = []
+        for (o in page.opacities) opacities.append(o)
+        val links: array<string> = []
+        for (l in page.links) links.append(l)
+        if (pdfA && page.usesCmyk) errors.append("PDF/A output here has an sRGB intent, which rules out CMYK colours")
+        pages.append(PdfStoredPage(page.width, page.height, content.toText(), fontIds, imageIds, opacities, links))
+    }
+
+    // Draws a table with its top left corner at (x, top), continuing on new pages
+    // below `bottom` from `restart` down. Returns the y where the table ended.
+    fun drawTable(var page: PdfPage, table: PdfTable, x: f64, top: f64, bottom: f64 = 36.0, restart: f64 = -1.0): f64 {
+        var y = top
+        val startY = if (restart >= 0.0) restart else page.height - 36.0
+        var index = 0
+        val headers = table.headerRows
+        while (index < table.rows.size) {
+            val height = tableRowHeight(table, index)
+            if (y - height < bottom && y < startY) {
+                addPage(page)
+                page.clear()
+                y = startY
+                for (h in 0 until headers) if (index >= headers) y = tableDrawRow(page, table, h, x, y)
+            }
+            y = tableDrawRow(page, table, index, x, y)
+            index = index + 1
+        }
+        y
+    }
+
+    fun tableCellFont(table: PdfTable, rowIndex: int, cell: PdfCell): PdfFont {
+        val chosen = cell.font
+        if (chosen != null) return fonts[chosen.id].font
+        val header = table.headerFont
+        if (rowIndex < table.headerRows && header != null) return fonts[header.id].font
+        fonts[table.font.id].font
+    }
+
+    fun tableCellWidth(table: PdfTable, column: int, span: int): f64 {
+        var w = 0.0
+        var c = column
+        while (c < column + span && c < table.widths.size) {
+            w = w + table.widths[c]
+            c = c + 1
+        }
+        w
+    }
+
+    fun tableRowHeight(table: PdfTable, rowIndex: int): f64 {
+        var most = 1
+        var column = 0
+        for (cell in table.rows[rowIndex]) {
+            val w = tableCellWidth(table, column, cell.span) - 2.0 * table.padding
+            val lines = pdfWrapText(tableCellFont(table, rowIndex, cell), table.size, cell.text, w).size
+            if (lines > most) most = lines
+            column = column + cell.span
+        }
+        f64FromInt(most) * table.size * 1.2 + 2.0 * table.padding
+    }
+
+    fun tableDrawRow(var page: PdfPage, table: PdfTable, rowIndex: int, x: f64, y: f64): f64 {
+        val height = tableRowHeight(table, rowIndex)
+        var column = 0
+        var cellX = x
+        for (cell in table.rows[rowIndex]) {
+            val w = tableCellWidth(table, column, cell.span)
+            val background = if (cell.fill >= 0) cell.fill else if (rowIndex < table.headerRows) table.headerFill else -1
+            if (background >= 0) {
+                page.save()
+                page.setFillRgb(background)
+                page.rect(cellX, y - height, w, height)
+                page.fill()
+                page.restore()
+            }
+            if (table.borderWidth > 0.0) {
+                page.save()
+                page.setLineWidth(table.borderWidth)
+                page.rect(cellX, y - height, w, height)
+                page.stroke()
+                page.restore()
+            }
+            val font = tableCellFont(table, rowIndex, cell)
+            page.save()
+            page.setFillRgb(cell.color)
+            val lineTop = y - table.padding - table.size * font.ascent() * 0.95
+            page.textBox(font, table.size, cellX + table.padding, lineTop, w - 2.0 * table.padding, cell.text, cell.align)
+            page.restore()
+            column = column + cell.span
+            cellX = cellX + w
+        }
+        y - height
+    }
+
+    fun filtered(var sink: ObjectSink, entries: string, data: string): int {
+        if (compress && data.size > 32) {
+            return sink.addStream("$entries /Filter /FlateDecode", pdfZlibCompress(data))
+        }
+        sink.addStream(entries, data)
+    }
+
+    fun writeFont(var sink: ObjectSink, id: int): int {
+        val stored = fonts[id]
+        val t = stored.font.truetype
+        if (t == null) {
+            if (pdfA) errors.append("PDF/A needs embedded fonts, not ${stored.font.name}")
+            return sink.add("<< /Type /Font /Subtype /Type1 /BaseFont ${pdfNameToken(stored.font.name)} /Encoding /WinAnsiEncoding >>")
+        }
+        val glyphs: array<int> = []
+        for (g in stored.glyphs) glyphs.append(g)
+        val file = pdfSubsetTrueType(t, glyphs)
+        val fileRef = filtered(sink, "/Length1 ${file.size}", file)
+        val tagHash = md5(stored.font.name + pdfHexEncode(file.slice(0, if (file.size < 4096) file.size else 4096)))
+        val tag = byteBuffer()
+        for (i in 0 until 6) tag.appendByteValue(65 + tagHash[i] % 26)
+        val baseName = tag.toText() + "+" + t.postScriptName
+        val upm = t.unitsPerEm
+        val scaled = { v: int -> v * 1000 / upm }
+        var flags = 4
+        if (t.fixedPitch) flags = flags | 1
+        if (t.italicAngle != 0) flags = flags | 64
+        val stemV = if (t.weightClass >= 600) 120 else 80
+        val descriptor = sink.add(
+            "<< /Type /FontDescriptor /FontName ${pdfNameToken(baseName)} /Flags $flags " +
+                "/FontBBox [${scaled(t.bbox[0])} ${scaled(t.bbox[1])} ${scaled(t.bbox[2])} ${scaled(t.bbox[3])}] " +
+                "/ItalicAngle ${t.italicAngle} /Ascent ${scaled(t.ascent)} /Descent ${scaled(t.descent)} " +
+                "/CapHeight ${scaled(t.capHeight)} /StemV $stemV /FontFile2 $fileRef 0 R >>"
+        )
+        val widths = byteBuffer()
+        widths.appendText("[0 [")
+        for (g in glyphs) {
+            widths.appendInt((t.advance(g) * 2000 + upm) / (2 * upm))
+            widths.appendText(" ")
+        }
+        widths.appendText("]]")
+        val cid = sink.add(
+            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont ${pdfNameToken(baseName)} " +
+                "/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> " +
+                "/FontDescriptor $descriptor 0 R /CIDToGIDMap /Identity /DW 1000 /W ${widths.toText()} >>"
+        )
+        val toUnicode = filtered(sink, "", toUnicodeCMap(stored.unicodes))
+        sink.add(
+            "<< /Type /Font /Subtype /Type0 /BaseFont ${pdfNameToken(baseName)} /Encoding /Identity-H " +
+                "/DescendantFonts [$cid 0 R] /ToUnicode $toUnicode 0 R >>"
+        )
+    }
+
+    fun writeImage(var sink: ObjectSink, id: int): int {
+        val img = images[id]
+        var entries = "/Type /XObject /Subtype /Image /Width ${img.width} /Height ${img.height} /BitsPerComponent 8 /ColorSpace "
+        entries = entries + (if (img.components == 1) "/DeviceGray" else if (img.components == 3) "/DeviceRGB" else "/DeviceCMYK")
+        if (img.invertedCmyk) entries = entries + " /Decode [1 0 1 0 1 0 1 0]"
+        if (img.alpha.size > 0) {
+            val mask = filtered(sink, "/Type /XObject /Subtype /Image /Width ${img.width} /Height ${img.height} /BitsPerComponent 8 /ColorSpace /DeviceGray", img.alpha)
+            entries = entries + " /SMask $mask 0 R"
+        }
+        if (pdfA && img.components == 4) errors.append("PDF/A output here has an sRGB intent, which rules out CMYK images")
+        if (img.isJpeg) return sink.addStream("$entries /Filter /DCTDecode", img.samples)
+        filtered(sink, entries, img.samples)
+    }
+
+    fun dateInfo(ms: int): string {
+        val d = utcDate(ms)
+        "D:${pad(d.year, 4)}${pad(d.month, 2)}${pad(d.day, 2)}${pad(d.hour, 2)}${pad(d.minute, 2)}${pad(d.second, 2)}Z"
+    }
+
+    fun dateXmp(ms: int): string {
+        val d = utcDate(ms)
+        "${pad(d.year, 4)}-${pad(d.month, 2)}-${pad(d.day, 2)}T${pad(d.hour, 2)}:${pad(d.minute, 2)}:${pad(d.second, 2)}Z"
+    }
+
+    fun pad(value: int, width: int): string {
+        var t = "$value"
+        while (t.size < width) t = "0$t"
+        t
+    }
+
+    fun infoDict(): string {
+        val out = byteBuffer()
+        out.appendText("<<")
+        if (title != "") out.appendText(" /Title ${pdfTextStringToken(title)}")
+        if (author != "") out.appendText(" /Author ${pdfTextStringToken(author)}")
+        if (subject != "") out.appendText(" /Subject ${pdfTextStringToken(subject)}")
+        if (keywords != "") out.appendText(" /Keywords ${pdfTextStringToken(keywords)}")
+        if (creator != "") out.appendText(" /Creator ${pdfTextStringToken(creator)}")
+        if (producer != "") out.appendText(" /Producer ${pdfTextStringToken(producer)}")
+        if (createdAt >= 0) out.appendText(" /CreationDate (${dateInfo(createdAt)})")
+        if (modifiedAt >= 0) out.appendText(" /ModDate (${dateInfo(modifiedAt)})")
+        out.appendText(" >>")
+        out.toText()
+    }
+
+    fun xmpPacket(): string {
+        val out = byteBuffer()
+        out.appendText("<?xpacket begin=\"\u{FEFF}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n")
+        out.appendText("<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n")
+        out.appendText("<rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:pdf=\"http://ns.adobe.com/pdf/1.3/\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\">\n")
+        if (title != "") out.appendText("<dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">${xmlEscape(title)}</rdf:li></rdf:Alt></dc:title>\n")
+        if (author != "") out.appendText("<dc:creator><rdf:Seq><rdf:li>${xmlEscape(author)}</rdf:li></rdf:Seq></dc:creator>\n")
+        if (subject != "") out.appendText("<dc:description><rdf:Alt><rdf:li xml:lang=\"x-default\">${xmlEscape(subject)}</rdf:li></rdf:Alt></dc:description>\n")
+        if (keywords != "") out.appendText("<pdf:Keywords>${xmlEscape(keywords)}</pdf:Keywords>\n")
+        if (producer != "") out.appendText("<pdf:Producer>${xmlEscape(producer)}</pdf:Producer>\n")
+        if (creator != "") out.appendText("<xmp:CreatorTool>${xmlEscape(creator)}</xmp:CreatorTool>\n")
+        if (createdAt >= 0) out.appendText("<xmp:CreateDate>${dateXmp(createdAt)}</xmp:CreateDate>\n")
+        if (modifiedAt >= 0) out.appendText("<xmp:ModifyDate>${dateXmp(modifiedAt)}</xmp:ModifyDate>\n")
+        if (pdfA) out.appendText("<pdfaid:part>2</pdfaid:part><pdfaid:conformance>B</pdfaid:conformance>\n")
+        out.appendText("</rdf:Description>\n</rdf:RDF></x:xmpmeta>\n<?xpacket end=\"w\"?>")
+        out.toText()
+    }
+
+    // The finished file. Call as often as needed; check `errors` afterwards.
+    fun toBytes(): string {
+        if (pages.size == 0) {
+            warnings.append("document has no pages; writing one blank page")
+            addPage(PdfPage())
+        }
+        val sink = ObjectSink([], [])
+        val catalogRef = sink.reserve()
+        val pagesRef = sink.reserve()
+        val fontRefs = filledArray(fonts.size, 0)
+        val imageRefs = filledArray(images.size, 0)
+        for (page in pages) {
+            for (id in page.fontIds) if (fontRefs[id] == 0) fontRefs[id] = writeFont(sink, id)
+            for (id in page.imageIds) if (imageRefs[id] == 0) imageRefs[id] = writeImage(sink, id)
+        }
+        val kids = byteBuffer()
+        for (page in pages) {
+            val resources = byteBuffer()
+            resources.appendText("<<")
+            if (page.fontIds.size > 0) {
+                resources.appendText(" /Font <<")
+                for (id in page.fontIds) resources.appendText(" /F$id ${fontRefs[id]} 0 R")
+                resources.appendText(" >>")
+            }
+            if (page.imageIds.size > 0) {
+                resources.appendText(" /XObject <<")
+                for (id in page.imageIds) resources.appendText(" /Im$id ${imageRefs[id]} 0 R")
+                resources.appendText(" >>")
+            }
+            if (page.opacities.size > 0) {
+                resources.appendText(" /ExtGState <<")
+                for (i in 0 until page.opacities.size) resources.appendText(" /GS$i ${page.opacities[i]}")
+                resources.appendText(" >>")
+            }
+            resources.appendText(" >>")
+            val content = filtered(sink, "", page.content)
+            var annots = ""
+            if (page.links.size > 0) {
+                val a = byteBuffer()
+                a.appendText(" /Annots [")
+                for (l in page.links) {
+                    a.appendText(l)
+                    a.appendText(" ")
+                }
+                a.appendText("]")
+                annots = a.toText()
+            }
+            val pageRef = sink.add(
+                "<< /Type /Page /Parent $pagesRef 0 R /MediaBox [0 0 ${pdfNumber(page.width)} ${pdfNumber(page.height)}] " +
+                    "/Resources ${resources.toText()} /Contents $content 0 R$annots >>"
+            )
+            kids.appendText("$pageRef 0 R ")
+        }
+        sink.set(pagesRef, "<< /Type /Pages /Kids [${kids.toText()}] /Count ${pages.size} >>")
+        val metadata = sink.addStream("/Type /Metadata /Subtype /XML", xmpPacket())
+        var catalog = "<< /Type /Catalog /Pages $pagesRef 0 R /Metadata $metadata 0 R"
+        if (language != "") catalog = catalog + " /Lang ${pdfTextStringToken(language)}"
+        if (pdfA) {
+            val icc = filtered(sink, "/N 3 /Alternate /DeviceRGB", pdfSrgbIccProfile())
+            catalog = catalog + " /OutputIntents [<< /Type /OutputIntent /S /GTS_PDFA1 " +
+                "/OutputConditionIdentifier (sRGB IEC61966-2.1) /Info (sRGB IEC61966-2.1) /DestOutputProfile $icc 0 R >>]"
+        }
+        sink.set(catalogRef, catalog + " >>")
+        val infoRef = sink.add(infoDict())
+        if (objectStreams) writeCompact(sink, catalogRef, infoRef) else writeClassic(sink, catalogRef, infoRef)
+    }
+
+    fun writeClassic(sink: ObjectSink, catalogRef: int, infoRef: int): string {
+        val out = byteBuffer()
+        out.appendText("%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
+        val offsets: array<int> = []
+        for (i in 0 until sink.bodies.size) {
+            offsets.append(out.size())
+            out.appendText("${i + 1} 0 obj\n")
+            out.appendText(sink.bodies[i])
+            out.appendText("\nendobj\n")
+        }
+        val id = pdfHexEncode(md5(out.toText()))
+        val xrefAt = out.size()
+        out.appendText("xref\n0 ${sink.bodies.size + 1}\n0000000000 65535 f \n")
+        for (offset in offsets) {
+            var text = "$offset"
+            while (text.size < 10) text = "0$text"
+            out.appendText("$text 00000 n \n")
+        }
+        out.appendText("trailer\n<< /Size ${sink.bodies.size + 1} /Root $catalogRef 0 R /Info $infoRef 0 R /ID [<$id> <$id>] >>\n")
+        out.appendText("startxref\n$xrefAt\n%%EOF\n")
+        out.toText()
+    }
+
+    fun writeCompact(sink: ObjectSink, catalogRef: int, infoRef: int): string {
+        val out = byteBuffer()
+        out.appendText("%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
+        val count = sink.bodies.size
+        // Entries of the cross-reference stream: type, field 2, field 3.
+        val kinds = filledArray(count + 1, 0)
+        val first = filledArray(count + 1, 0)
+        val second = filledArray(count + 1, 0)
+        val packed: array<int> = []
+        for (i in 0 until count) {
+            if (sink.streams[i]) {
+                kinds[i + 1] = 1
+                first[i + 1] = out.size()
+                out.appendText("${i + 1} 0 obj\n")
+                out.appendText(sink.bodies[i])
+                out.appendText("\nendobj\n")
+            } else packed.append(i + 1)
+        }
+        var extra: array<int> = []
+        var nextNumber = count + 1
+        var at = 0
+        while (at < packed.size) {
+            val stop = if (at + 100 < packed.size) at + 100 else packed.size
+            val header = byteBuffer()
+            val body = byteBuffer()
+            for (k in at until stop) {
+                header.appendText("${packed[k]} ${body.size()} ")
+                body.appendText(sink.bodies[packed[k] - 1])
+                body.appendText("\n")
+            }
+            val headerText = header.toText()
+            val data = headerText + body.toText()
+            val number = nextNumber
+            nextNumber = nextNumber + 1
+            extra.append(number)
+            extra.append(out.size())
+            for (k in at until stop) {
+                kinds[packed[k]] = 2
+                first[packed[k]] = number
+                second[packed[k]] = k - at
+            }
+            val entries = "/Type /ObjStm /N ${stop - at} /First ${headerText.size}"
+            val payload = if (compress) pdfZlibCompress(data) else data
+            val filter = if (compress) " /Filter /FlateDecode" else ""
+            out.appendText("$number 0 obj\n<< $entries$filter /Length ${payload.size} >>\nstream\n")
+            out.appendText(payload)
+            out.appendText("\nendstream\nendobj\n")
+            at = stop
+        }
+        val id = pdfHexEncode(md5(out.toText()))
+        val xrefNumber = nextNumber
+        val xrefAt = out.size()
+        val table = byteBuffer()
+        val addRow = { kind: int, a: int, b: int ->
+            table.appendByteValue(kind)
+            table.pdfAppendU32(a)
+            table.pdfAppendU16(b)
+        }
+        addRow(0, 0, 65535)
+        for (n in 1 until count + 1) addRow(kinds[n], first[n], second[n])
+        var e = 0
+        while (e < extra.size) {
+            addRow(1, extra[e + 1], 0)
+            e = e + 2
+        }
+        addRow(1, xrefAt, 0)
+        val raw = table.toText()
+        val payload = if (compress) pdfZlibCompress(raw) else raw
+        val filter = if (compress) " /Filter /FlateDecode" else ""
+        out.appendText("$xrefNumber 0 obj\n<< /Type /XRef /Size ${xrefNumber + 1} /W [1 4 2] /Root $catalogRef 0 R /Info $infoRef 0 R /ID [<$id> <$id>]$filter /Length ${payload.size} >>\nstream\n")
+        out.appendText(payload)
+        out.appendText("\nendstream\nendobj\nstartxref\n$xrefAt\n%%EOF\n")
+        out.toText()
+    }
+
+    fun toUnicodeCMap(unicodes: array<int>): string {
+        val out = byteBuffer()
+        out.appendText("/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n")
+        out.appendText("/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n")
+        out.appendText("/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n")
+        out.appendText("1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n")
+        var at = 1
+        while (at < unicodes.size) {
+            val stop = if (at + 100 < unicodes.size) at + 100 else unicodes.size
+            out.appendText("${stop - at} beginbfchar\n")
+            for (k in at until stop) out.appendText("<${pdfHexU16(k)}> <${pdfUtf16Hex(unicodes[k])}>\n")
+            out.appendText("endbfchar\n")
+            at = stop
+        }
+        out.appendText("endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n")
+        out.toText()
+    }
+}

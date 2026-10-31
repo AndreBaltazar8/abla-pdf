@@ -1,0 +1,422 @@
+// TrueType reading and subsetting for embedding. The font file is untrusted:
+// every read goes through bounds-checked helpers, and glyph traversal is limited
+// to the glyphs the font declares.
+
+import "abla/bytes"
+import "abla/text"
+
+class PdfTrueType(
+    val data: string,
+    val ok: bool,
+    val error: string,
+    val offsets: Map<string, int>,
+    val lengths: Map<string, int>,
+    val unitsPerEm: int,
+    val glyphCount: int,
+    val metricCount: int,
+    val longLoca: bool,
+    val ascent: int,
+    val descent: int,
+    val capHeight: int,
+    val italicAngle: int,
+    val weightClass: int,
+    val fixedPitch: bool,
+    val bbox: array<int>,
+    val postScriptName: string,
+    val cmap: Map<int, int>,
+    val embedding: int
+) {
+    fun tableOffset(tag: string): int = offsets.get(tag) ?? -1
+    fun tableLength(tag: string): int = lengths.get(tag) ?? 0
+
+    fun glyphFor(codePoint: int): int = cmap.get(codePoint) ?? 0
+
+    // The advance width in font units.
+    fun advance(glyph: int): int {
+        val hmtx = tableOffset("hmtx")
+        if (hmtx < 0 || metricCount == 0) return 0
+        val index = if (glyph < metricCount) glyph else metricCount - 1
+        pdfU16(data, hmtx + index * 4)
+    }
+
+    fun leftBearing(glyph: int): int {
+        val hmtx = tableOffset("hmtx")
+        if (hmtx < 0 || metricCount == 0) return 0
+        if (glyph < metricCount) return pdfI16(data, hmtx + glyph * 4 + 2)
+        pdfI16(data, hmtx + metricCount * 4 + (glyph - metricCount) * 2)
+    }
+
+    // Glyph data as packed begin * 2^32 + end within the glyf table, or -1.
+    fun glyphRange(glyph: int): int {
+        if (glyph < 0 || glyph >= glyphCount) return -1
+        val loca = tableOffset("loca")
+        val glyf = tableOffset("glyf")
+        if (loca < 0 || glyf < 0) return -1
+        var begin = 0
+        var end = 0
+        if (longLoca) {
+            if (loca + glyph * 4 + 8 > data.size) return -1
+            begin = pdfU32(data, loca + glyph * 4)
+            end = pdfU32(data, loca + glyph * 4 + 4)
+        } else {
+            if (loca + glyph * 2 + 4 > data.size) return -1
+            begin = pdfU16(data, loca + glyph * 2) * 2
+            end = pdfU16(data, loca + glyph * 2 + 2) * 2
+        }
+        val available = tableLength("glyf")
+        if (end > available) end = available
+        if (begin > end) return -1
+        (begin << 32) | end
+    }
+
+    fun glyphBytes(glyph: int): string {
+        val range = glyphRange(glyph)
+        if (range < 0) return ""
+        val glyf = tableOffset("glyf")
+        pdfClampedSlice(data, glyf + (range >>> 32), glyf + (range & 0xffffffff))
+    }
+}
+
+private fun failed(data: string, reason: string): PdfTrueType = PdfTrueType(
+    "", false, reason, Map<string, int>(), Map<string, int>(), 1000, 0, 0, false,
+    0, 0, 0, 0, 400, false, [0, 0, 0, 0], "", Map<int, int>(), 0
+)
+
+private fun readFormat4(data: string, at: int, end: int, var out: Map<int, int>): void {
+    val segments = pdfU16(data, at + 6) / 2
+    val ends = at + 14
+    val starts = ends + segments * 2 + 2
+    val deltas = starts + segments * 2
+    val ranges = deltas + segments * 2
+    for (i in 0 until segments) {
+        val last = pdfU16(data, ends + i * 2)
+        val first = pdfU16(data, starts + i * 2)
+        val delta = pdfU16(data, deltas + i * 2)
+        val rangeAt = ranges + i * 2
+        val rangeOffset = pdfU16(data, rangeAt)
+        if (first <= last) {
+            var cp = first
+            while (cp <= last && cp != 0xffff) {
+                var glyph = 0
+                if (rangeOffset == 0) glyph = (cp + delta) & 0xffff
+                else {
+                    val slot = rangeAt + rangeOffset + (cp - first) * 2
+                    if (slot + 2 <= end) {
+                        glyph = pdfU16(data, slot)
+                        if (glyph != 0) glyph = (glyph + delta) & 0xffff
+                    }
+                }
+                if (glyph != 0) out.set(cp, glyph)
+                cp = cp + 1
+            }
+        }
+    }
+    return
+}
+
+private fun readFormat12(data: string, at: int, end: int, var out: Map<int, int>): void {
+    val groups = pdfU32(data, at + 12)
+    var total = 0
+    var i = 0
+    while (i < groups && at + 16 + (i + 1) * 12 <= end && total < 400000) {
+        val g = at + 16 + i * 12
+        val first = pdfU32(data, g)
+        val last = pdfU32(data, g + 4)
+        val glyph = pdfU32(data, g + 8)
+        if (last >= first && last <= 0x10ffff) {
+            var cp = first
+            while (cp <= last && total < 400000) {
+                out.set(cp, glyph + cp - first)
+                cp = cp + 1
+                total = total + 1
+            }
+        }
+        i = i + 1
+    }
+    return
+}
+
+private fun readCmap(data: string, offset: int, length: int): Map<int, int> {
+    val out = Map<int, int>()
+    if (offset < 0) return out
+    val tables = pdfU16(data, offset + 2)
+    var best = -1
+    var bestScore = 0
+    for (i in 0 until tables) {
+        val rec = offset + 4 + i * 8
+        val platform = pdfU16(data, rec)
+        val encoding = pdfU16(data, rec + 2)
+        val at = offset + pdfU32(data, rec + 4)
+        val format = pdfU16(data, at)
+        var score = 0
+        if (format == 12 && (platform == 3 && encoding == 10 || platform == 0)) score = 4
+        else if (format == 4 && platform == 3 && encoding == 1) score = 3
+        else if (format == 4 && platform == 0) score = 2
+        if (score > bestScore) {
+            bestScore = score
+            best = at
+        }
+    }
+    if (best < 0) return out
+    val end = if (offset + length < data.size) offset + length else data.size
+    if (pdfU16(data, best) == 12) readFormat12(data, best, end, out)
+    else readFormat4(data, best, end, out)
+    out
+}
+
+private fun readPostScriptName(data: string, offset: int): string {
+    if (offset < 0) return ""
+    val count = pdfU16(data, offset + 2)
+    val storage = offset + pdfU16(data, offset + 4)
+    var result = ""
+    for (i in 0 until count) {
+        val rec = offset + 6 + i * 12
+        if (pdfU16(data, rec + 6) == 6) {
+            val platform = pdfU16(data, rec)
+            val length = pdfU16(data, rec + 8)
+            val at = storage + pdfU16(data, rec + 10)
+            val raw = pdfClampedSlice(data, at, at + length)
+            if (platform == 3 || platform == 0) result = pdfUtf16ToUtf8(raw)
+            else if (result == "") result = raw
+        }
+    }
+    // A PostScript name holds printable ASCII without delimiters.
+    val clean = byteBuffer()
+    for (b in result) {
+        val bad = b <= 32 || b >= 127 || b == 40 || b == 41 || b == 60 || b == 62 || b == 91 ||
+            b == 93 || b == 123 || b == 125 || b == 47 || b == 37
+        if (!bad) clean.appendByteValue(b)
+    }
+    clean.toText()
+}
+
+// Parses a TrueType font, or the first font of a collection. `ok` is false, with
+// the reason in `error`, for anything that can't be embedded as TrueType.
+fun pdfParseTrueType(data: string): PdfTrueType {
+    if (data.size < 12) return failed(data, "font file too short")
+    var directory = 0
+    if (pdfStartsWithAt(data, 0, "ttcf")) directory = pdfU32(data, 12)
+    if (pdfStartsWithAt(data, directory, "OTTO")) {
+        return failed(data, "OpenType fonts with CFF outlines are not supported; use TrueType outlines")
+    }
+    val version = pdfU32(data, directory)
+    if (version != 0x00010000 && !pdfStartsWithAt(data, directory, "true")) {
+        return failed(data, "not a TrueType font")
+    }
+    val tables = pdfU16(data, directory + 4)
+    val offsets = Map<string, int>()
+    val lengths = Map<string, int>()
+    for (i in 0 until tables) {
+        val rec = directory + 12 + i * 16
+        if (rec + 16 > data.size) return failed(data, "truncated table directory")
+        val tag = data.slice(rec, rec + 4)
+        val offset = pdfU32(data, rec + 8)
+        val length = pdfU32(data, rec + 12)
+        if (offset + length <= data.size) {
+            offsets.set(tag, offset)
+            lengths.set(tag, length)
+        }
+    }
+    for (tag in ["head", "hhea", "hmtx", "maxp", "loca", "glyf", "cmap"]) {
+        if (!offsets.has(tag)) return failed(data, "font has no $tag table")
+    }
+    val head = offsets.get("head") ?? 0
+    val hhea = offsets.get("hhea") ?? 0
+    val maxp = offsets.get("maxp") ?? 0
+    val unitsPerEm = pdfU16(data, head + 18)
+    if (unitsPerEm < 16 || unitsPerEm > 16384) return failed(data, "invalid unitsPerEm")
+    val glyphCount = pdfU16(data, maxp + 4)
+    val metricCount = pdfU16(data, hhea + 34)
+    if (glyphCount == 0 || metricCount == 0) return failed(data, "font has no glyphs")
+    val hmtxLength = lengths.get("hmtx") ?? 0
+    if (metricCount * 4 > hmtxLength) return failed(data, "hmtx table too short")
+    val longLoca = pdfI16(data, head + 50) != 0
+    val locaEntry = if (longLoca) 4 else 2
+    if ((glyphCount + 1) * locaEntry > (lengths.get("loca") ?? 0)) return failed(data, "loca table too short")
+    var ascent = pdfI16(data, hhea + 4)
+    var descent = pdfI16(data, hhea + 6)
+    var capHeight = ascent
+    var weight = 400
+    var embedding = 0
+    val os2 = offsets.get("OS/2") ?? -1
+    if (os2 >= 0) {
+        embedding = pdfU16(data, os2 + 8)
+        weight = pdfU16(data, os2 + 4)
+        val sTypoAscender = pdfI16(data, os2 + 68)
+        if (ascent == 0) ascent = sTypoAscender
+        if (descent == 0) descent = pdfI16(data, os2 + 70)
+        if ((lengths.get("OS/2") ?? 0) >= 90 && pdfU16(data, os2) >= 2) {
+            val declared = pdfI16(data, os2 + 88)
+            if (declared > 0) capHeight = declared
+        }
+    }
+    var italicAngle = 0
+    var fixedPitch = false
+    val post = offsets.get("post") ?? -1
+    if (post >= 0) {
+        italicAngle = pdfI16(data, post + 4)
+        fixedPitch = pdfU32(data, post + 12) != 0
+    }
+    val bbox = [pdfI16(data, head + 36), pdfI16(data, head + 38), pdfI16(data, head + 40), pdfI16(data, head + 42)]
+    var name = readPostScriptName(data, offsets.get("name") ?? -1)
+    if (name == "") name = "EmbeddedFont"
+    PdfTrueType(
+        data, true, "", offsets, lengths, unitsPerEm, glyphCount, metricCount, longLoca,
+        ascent, descent, capHeight, italicAngle, weight, fixedPitch, bbox, name,
+        readCmap(data, offsets.get("cmap") ?? -1, lengths.get("cmap") ?? 0), embedding
+    )
+}
+
+// Component glyphs of a composite glyph, as positions of their glyph indexes in
+// the glyph's bytes.
+private fun compositeSlots(glyph: string): array<int> {
+    val slots: array<int> = []
+    if (glyph.size < 10 || pdfI16(glyph, 0) >= 0) return slots
+    var at = 10
+    var more = true
+    while (more && at + 4 <= glyph.size) {
+        val flags = pdfU16(glyph, at)
+        slots.append(at + 2)
+        at = at + 4
+        at = at + (if ((flags & 1) != 0) 4 else 2)
+        if ((flags & 8) != 0) at = at + 2
+        else if ((flags & 0x40) != 0) at = at + 4
+        else if ((flags & 0x80) != 0) at = at + 8
+        more = (flags & 0x20) != 0
+    }
+    slots
+}
+
+private fun checksum(table: string): int {
+    var sum = 0
+    var i = 0
+    while (i + 4 <= table.size) {
+        sum = (sum + pdfU32(table, i)) & 0xffffffff
+        i = i + 4
+    }
+    var shift = 24
+    while (i < table.size) {
+        sum = (sum + (table[i] << shift)) & 0xffffffff
+        shift = shift - 8
+        i = i + 1
+    }
+    sum
+}
+
+// `glyphs[newIndex]` is the original glyph for each new index; the list grows
+// with the components of composite glyphs. Returns a TrueType file holding only
+// these glyphs, numbered by their position in the list.
+fun pdfSubsetTrueType(font: PdfTrueType, var glyphs: array<int>): string {
+    val newIndex = Map<int, int>()
+    for (i in 0 until glyphs.size) newIndex.set(glyphs[i], i)
+    var cursor = 0
+    while (cursor < glyphs.size) {
+        val bytes = font.glyphBytes(glyphs[cursor])
+        for (slot in compositeSlots(bytes)) {
+            val component = pdfU16(bytes, slot)
+            if (!newIndex.has(component) && component < font.glyphCount) {
+                newIndex.set(component, glyphs.size)
+                glyphs.append(component)
+            }
+        }
+        cursor = cursor + 1
+    }
+    val glyf = byteBuffer()
+    val loca = byteBuffer()
+    val hmtx = byteBuffer()
+    for (original in glyphs) {
+        loca.pdfAppendU32(glyf.size())
+        var bytes = font.glyphBytes(original)
+        val slots = compositeSlots(bytes)
+        if (slots.size > 0) {
+            val rewritten = byteBuffer()
+            var at = 0
+            for (slot in slots) {
+                rewritten.appendText(bytes.slice(at, slot))
+                rewritten.pdfAppendU16(newIndex.get(pdfU16(bytes, slot)) ?? 0)
+                at = slot + 2
+            }
+            rewritten.appendText(bytes.slice(at, bytes.size))
+            bytes = rewritten.toText()
+        }
+        glyf.appendText(bytes)
+        if (bytes.size % 4 != 0) glyf.appendText("\0\0\0".slice(0, 4 - bytes.size % 4))
+        hmtx.pdfAppendU16(font.advance(original))
+        hmtx.pdfAppendU16(font.leftBearing(original) & 0xffff)
+    }
+    loca.pdfAppendU32(glyf.size())
+
+    val data = font.data
+    val headAt = font.tableOffset("head")
+    val headRaw = pdfClampedSlice(data, headAt, headAt + 54)
+    val head = headRaw.slice(0, 8) + "\0\0\0\0" + headRaw.slice(12, 50) + "\0\x01\0\0"
+    val hheaAt = font.tableOffset("hhea")
+    val hheaRaw = pdfClampedSlice(data, hheaAt, hheaAt + 36)
+    val hheaEnd = byteBuffer()
+    hheaEnd.pdfAppendU16(glyphs.size)
+    val hhea = hheaRaw.slice(0, 34) + hheaEnd.toText()
+    val maxpAt = font.tableOffset("maxp")
+    val maxpRaw = pdfClampedSlice(data, maxpAt, maxpAt + font.tableLength("maxp"))
+    val maxpCount = byteBuffer()
+    maxpCount.pdfAppendU16(glyphs.size)
+    val maxp = maxpRaw.slice(0, 4) + maxpCount.toText() + maxpRaw.slice(6, maxpRaw.size)
+    val post = pdfHexDecode("00030000") + "\0".repeat(28)
+
+    val tags: array<string> = []
+    val bodies: array<string> = []
+    for (tag in ["cvt ", "fpgm", "glyf", "head", "hhea", "hmtx", "loca", "maxp", "post", "prep"]) {
+        var body = ""
+        var present = true
+        when (tag) {
+            "glyf" -> body = glyf.toText()
+            "head" -> body = head
+            "hhea" -> body = hhea
+            "hmtx" -> body = hmtx.toText()
+            "loca" -> body = loca.toText()
+            "maxp" -> body = maxp
+            "post" -> body = post
+            else -> {
+                val at = font.tableOffset(tag)
+                if (at < 0) present = false
+                else body = pdfClampedSlice(data, at, at + font.tableLength(tag))
+            }
+        }
+        if (present) {
+            tags.append(tag)
+            bodies.append(body)
+        }
+    }
+    val count = tags.size
+    var power = 1
+    var log = 0
+    while (power * 2 <= count) {
+        power = power * 2
+        log = log + 1
+    }
+    val header = byteBuffer()
+    header.pdfAppendU32(0x00010000)
+    header.pdfAppendU16(count)
+    header.pdfAppendU16(power * 16)
+    header.pdfAppendU16(log)
+    header.pdfAppendU16(count * 16 - power * 16)
+    var offset = 12 + count * 16
+    var headOffset = 0
+    for (i in 0 until count) {
+        header.appendText(tags[i])
+        header.pdfAppendU32(checksum(bodies[i]))
+        header.pdfAppendU32(offset)
+        header.pdfAppendU32(bodies[i].size)
+        if (tags[i] == "head") headOffset = offset
+        offset = offset + ((bodies[i].size + 3) & ~3)
+    }
+    val file = byteBuffer()
+    file.appendText(header.toText())
+    for (i in 0 until count) {
+        file.appendText(bodies[i])
+        if (bodies[i].size % 4 != 0) file.appendText("\0\0\0".slice(0, 4 - bodies[i].size % 4))
+    }
+    val whole = file.toText()
+    val adjustment = byteBuffer()
+    adjustment.pdfAppendU32((0xb1b0afba - checksum(whole)) & 0xffffffff)
+    whole.slice(0, headOffset + 8) + adjustment.toText() + whole.slice(headOffset + 12, whole.size)
+}

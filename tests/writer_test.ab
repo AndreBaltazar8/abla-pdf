@@ -1,0 +1,192 @@
+// Generates a set of PDF files under build/generated, checks what can be checked
+// without a reader, and leaves the files for tools/check-generated.sh, which
+// runs qpdf, poppler and veraPDF on them.
+
+import "abla/test"
+import "abla/fs"
+import "abla/text"
+import "abla/bytes"
+import "abla/process"
+import "../src/pdf.ab"
+
+val PORTUGUESE = "Olá, São João: ação, coração, pão, mãe, avó, você, à, é, ê, í, ó, ô, õ, ú, ü, ç, Á À Â Ã É Ê Í Ó Ô Õ Ú Ç €"
+
+fun out(name: string, data: string): void {
+    path("build/generated").createDirectories()
+    expect(path("build/generated/$name").writeText(data), "write $name")
+    return
+}
+
+fun fontBytes(): string = path("tests/fixtures/DejaVuSans-Latin.ttf").readText()
+
+fun gradient(w: int, h: int, components: int): string {
+    val b = byteBuffer()
+    for (y in 0 until h) for (x in 0 until w) for (c in 0 until components) {
+        b.appendByteValue(if (c == 0) x * 255 / w else if (c == 1) y * 255 / h else 128)
+    }
+    b.toText()
+}
+
+fun metadata(var doc: PdfDocument): void {
+    doc.title = "Documento de ação"
+    doc.author = "André Baltazar"
+    doc.subject = "Teste <geração> & leitura"
+    doc.keywords = "pdf, açúcar"
+    doc.creator = "abla-pdf tests"
+    doc.createdAt = 1767225600000
+    doc.modifiedAt = 1767229200000
+    doc.language = "pt-PT"
+    return
+}
+
+fun drawEverything(var doc: PdfDocument, font: PdfFont, usePng: string, cmyk: bool = true): void {
+    val page = PdfPage()
+    page.textBox(font, 12.0, 50.0, 810.0, 495.0, PORTUGUESE)
+    page.text(font, 10.0, 50.0, 770.0, "Combining: São João, ç")
+    page.setStrokeRgb(0xcc0000)
+    page.setLineWidth(2.0)
+    page.setDash([4.0, 2.0])
+    page.line(50.0, 760.0, 300.0, 760.0)
+    page.setDash([])
+    page.setFillColor(0.2, 0.4, 0.8)
+    page.circle(100.0, 700.0, 30.0)
+    page.fillAndStroke()
+    if (cmyk) page.setFillCmyk(0.1, 0.6, 0.0, 0.1)
+    page.roundedRect(150.0, 670.0, 80.0, 60.0, 10.0)
+    page.fill()
+    page.save()
+    page.translate(300.0, 700.0)
+    page.rotate(30.0)
+    page.setOpacity(0.5)
+    page.setFillGray(0.2)
+    page.rect(0.0, 0.0, 80.0, 30.0)
+    page.fill()
+    page.restore()
+    page.setFillGray(0.0)
+    val raw = doc.addRawImage(32, 16, 3, gradient(32, 16, 3))
+    expect(raw.ok, "raw image")
+    page.image(raw, 50.0, 600.0, 128.0, 64.0)
+    val withAlpha = doc.addRawImage(16, 16, 1, gradient(16, 16, 1), gradient(16, 16, 1))
+    page.image(withAlpha, 190.0, 600.0, 64.0, 64.0)
+    val png = doc.addPng(usePng)
+    expect(png.ok, "png image: ${png.error}")
+    page.image(png, 260.0, 600.0, 64.0, 64.0)
+    val next = page.textBox(font, 11.0, 50.0, 580.0, 200.0,
+        "Este parágrafo é longo o suficiente para ser dividido em várias linhas e testar a função de quebra de texto, com acentuação.", pdfAlignLeft)
+    expect(next < 580.0 - 2.0 * 11.0, "paragraph wrapped")
+    page.textBox(font, 11.0, 300.0, 580.0, 200.0, "Alinhado à direita, com várias palavras que têm de quebrar.", pdfAlignRight)
+    page.link(50.0, 785.0, 200.0, 20.0, "https://example.com/ação")
+    doc.addPage(page)
+    page.clear()
+    val table = PdfTable([200.0, 100.0, 195.0], font, 10.0, headerRows = 1)
+    table.row(["Coluna à esquerda", "Número", "Observações"])
+    for (i in 0 until 80) {
+        val c = if (i % 3 == 0) "Observação longa que obriga a linha a quebrar dentro da célula da tabela, número $i" else "ok"
+        table.cells([PdfCell("Linha $i — açúcar"), PdfCell("${i * 37}", pdfAlignRight), PdfCell(c, pdfAlignCenter)])
+    }
+    table.cells([PdfCell("Total com duas colunas", pdfAlignRight, null, 2, 0xeeeeee), PdfCell("fim")])
+    val end = doc.drawTable(page, table, 50.0, 800.0)
+    expect(end > 0.0, "table end position")
+    doc.addPage(page)
+    return
+}
+
+fun smallPng(): string {
+    // A 2x2 RGBA PNG, as written by Python's zlib and struct.
+    pdfHexDecode("89504e470d0a1a0a0000000d494844520000000200000002080600000072b60d240000001649444154789c63f8cfc0f01f081b1880341030380000421507ba5ab976cd0000000049454e44ae426082")
+}
+
+fun main: int {
+    val data = fontBytes()
+    val parsed = pdfParseTrueType(data)
+    expect(parsed.ok, "font parses: ${parsed.error}")
+    expect(parsed.glyphFor(0xe3) != 0, "font has ã")
+    expect(!pdfParseTrueType("garbage").ok, "garbage font rejected")
+    expect(!pdfParseTrueType("OTTO" + "\0".repeat(100)).ok, "CFF font rejected")
+    for (seed in 1 until 200) {
+        val cut = (seed * 7919) % data.size
+        val r = pdfParseTrueType(data.slice(0, cut))
+        if (r.ok) r.advance(r.glyphFor(65))
+    }
+
+    expectEqual(pdfNumber(1.5), "1.5", "number")
+    expectEqual(pdfNumber(-0.25), "-0.25", "negative")
+    expectEqual(pdfNumber(100.0), "100", "whole")
+    expectEqual(pdfNumber(0.00001), "0", "tiny")
+    expectEqual(pdfNumber(0.0704), "0.0704", "leading zero fraction")
+    expectEqual(pdfTextStringToken("abc(d)"), "(abc\\(d\\))", "literal token")
+    expectEqual(pdfTextStringToken("é"), "<FEFF00E9>", "utf-16 token")
+    expectEqual(pdfNameToken("A B#"), "/A#20B#23", "name token")
+
+    val full = PdfDocument()
+    metadata(full)
+    val font = full.embedFont(data)
+    expect(font.ok, "embed font: ${font.error}")
+    expect(font.textWidth("Ação", 10.0) > 0.0, "text width")
+    expect(font.hasGlyph(0xe7), "has ç")
+    expectEqual(pdfTextCodePoints("ã")[0], 0xe3, "composition")
+    drawEverything(full, font, smallPng())
+    expectEqual(full.errors.size, 0, "no errors")
+    val bytes = full.toBytes()
+    expect(bytes.startsWith("%PDF-1.7"), "header")
+    expect(bytes.size < 200000, "subset keeps the file small (${bytes.size})")
+    expect(bytes == full.toBytes(), "toBytes is repeatable")
+    out("full.pdf", bytes)
+    expect(pdfSubsetTrueType(parsed, [0, parsed.glyphFor(65)]).size < data.size / 4, "subset is much smaller")
+
+    val compact = PdfDocument(objectStreams = true)
+    metadata(compact)
+    drawEverything(compact, compact.embedFont(data), smallPng())
+    out("object-streams.pdf", compact.toBytes())
+
+    val plain = PdfDocument(compress = false)
+    metadata(plain)
+    drawEverything(plain, plain.embedFont(data), smallPng())
+    out("uncompressed.pdf", plain.toBytes())
+
+    val archive = PdfDocument(pdfA = true)
+    metadata(archive)
+    drawEverything(archive, archive.embedFont(data), smallPng(), false)
+    out("pdfa.pdf", archive.toBytes())
+    expectEqual(archive.errors.size, 0, "pdfa has no errors")
+
+    val std = PdfDocument()
+    val helvetica = std.standardFont("Helvetica")
+    val page = PdfPage(pdfLetterWidth, pdfLetterHeight)
+    page.text(helvetica, 14.0, 50.0, 700.0, PORTUGUESE)
+    page.text(std.standardFont("Times-BoldItalic"), 14.0, 50.0, 680.0, "Times: São João, €10")
+    page.text(std.standardFont("Courier-Bold"), 14.0, 50.0, 660.0, "Courier: ação")
+    std.addPage(page)
+    expectEqual(std.errors.size, 0, "standard fonts")
+    expect(helvetica.textWidth("A", 1000.0) > 660.0, "helvetica metric")
+    out("standard-fonts.pdf", std.toBytes())
+    val badFont = std.standardFont("Comic-Sans")
+    expect(!badFont.ok, "unknown standard font")
+
+    val strict = PdfDocument(pdfA = true)
+    val p2 = PdfPage()
+    p2.text(strict.standardFont("Helvetica"), 12.0, 10.0, 10.0, "x")
+    strict.addPage(p2)
+    strict.toBytes()
+    expect(strict.errors.size > 0, "PDF/A rejects a font that is not embedded")
+
+    val missing = PdfDocument()
+    val p3 = PdfPage()
+    p3.text(missing.embedFont(data), 12.0, 10.0, 10.0, "日本")
+    missing.addPage(p3)
+    expect(missing.warnings.size > 0, "missing glyph is reported")
+
+    val cmykInArchive = PdfDocument(pdfA = true)
+    val p4 = PdfPage()
+    p4.setFillCmyk(0.0, 0.0, 0.0, 1.0)
+    cmykInArchive.addPage(p4)
+    expect(cmykInArchive.errors.size > 0, "PDF/A rejects CMYK")
+
+    val empty = PdfDocument()
+    out("no-pages.pdf", empty.toBytes())
+    expect(empty.warnings.size > 0, "an empty document gets a blank page")
+    expect(!empty.addJpeg("not jpeg").ok, "bad jpeg")
+    expect(!empty.addPng("not png").ok, "bad png")
+    expect(!empty.addRawImage(2, 2, 3, "x").ok, "bad raw")
+    testsPassed()
+}

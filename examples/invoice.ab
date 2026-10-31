@@ -1,0 +1,26 @@
+// Writes a one-page invoice-like document using most of the generation API:
+//   ablac run examples/invoice.ab -- font.ttf out.pdf
+import "abla/fs"
+import "abla/process"
+import "../src/pdf.ab"
+
+fun main: int {
+    val fontPath = processArgument(1)
+    val outPath = processArgument(2)
+    val doc = PdfDocument(title = "Fatura FT 2026/1", author = "Associação Exemplo", subject = "Exemplo de faturação")
+    val font = doc.embedFont(path(fontPath).readText())
+    if (!font.ok) return 1
+    val page = PdfPage()
+    page.text(font, 20.0, 50.0, 790.0, "Fatura FT 2026/1")
+    page.setFillRgb(0x444444)
+    page.text(font, 10.0, 50.0, 770.0, "Associação de Educação Física de São João — Coração, ação, língua, Évora, Açores")
+    page.setFillGray(0.0)
+    val table = PdfTable([250.0, 60.0, 80.0, 90.0], font, 10.0, headerRows = 1)
+    table.cells([PdfCell("Descrição"), PdfCell("Qtd.", pdfAlignRight), PdfCell("Preço", pdfAlignRight), PdfCell("Total", pdfAlignRight)])
+    table.cells([PdfCell("Prestação de serviços de consultoria, incluindo deslocações"), PdfCell("2", pdfAlignRight), PdfCell("150,00 €", pdfAlignRight), PdfCell("300,00 €", pdfAlignRight)])
+    table.cells([PdfCell("Formação"), PdfCell("1", pdfAlignRight), PdfCell("99,50 €", pdfAlignRight), PdfCell("99,50 €", pdfAlignRight)])
+    doc.drawTable(page, table, 50.0, 740.0)
+    doc.addPage(page)
+    if (!path(outPath).writeText(doc.toBytes())) return 2
+    doc.errors.size
+}

@@ -1,0 +1,98 @@
+// A small sRGB ICC profile, generated rather than vendored: an ICC v2 display
+// profile with the D50-adapted sRGB primaries and the sRGB transfer curve. PDF/A
+// needs one for its output intent.
+
+import "abla/bytes"
+import "abla/float"
+import "abla/math"
+
+private fun s15(value: f64): int = f64ToInt(floor(value * 65536.0 + 0.5))
+
+private fun xyzTag(x: f64, y: f64, z: f64): string {
+    val out = byteBuffer()
+    out.appendText("XYZ \0\0\0\0")
+    out.pdfAppendU32(s15(x))
+    out.pdfAppendU32(s15(y))
+    out.pdfAppendU32(s15(z))
+    out.toText()
+}
+
+private fun curveTag(): string {
+    val out = byteBuffer()
+    out.appendText("curv\0\0\0\0")
+    out.pdfAppendU32(1024)
+    for (i in 0 until 1024) {
+        val c = f64FromInt(i) / 1023.0
+        val linear = if (c <= 0.04045) c / 12.92 else pow((c + 0.055) / 1.055, 2.4)
+        out.pdfAppendU16(f64ToInt(floor(linear * 65535.0 + 0.5)))
+    }
+    out.toText()
+}
+
+private fun textTag(text: string): string {
+    val out = byteBuffer()
+    out.appendText("text\0\0\0\0")
+    out.appendText(text)
+    out.appendText("\0")
+    out.toText()
+}
+
+private fun descTag(text: string): string {
+    val out = byteBuffer()
+    out.appendText("desc\0\0\0\0")
+    out.pdfAppendU32(text.size + 1)
+    out.appendText(text)
+    out.appendText("\0")
+    // Empty Unicode and ScriptCode descriptions.
+    out.appendText("\0".repeat(4 + 4 + 2 + 1 + 67))
+    out.toText()
+}
+
+fun pdfSrgbIccProfile(): string {
+    val curve = curveTag()
+    val tags = ["desc", "cprt", "wtpt", "rXYZ", "gXYZ", "bXYZ", "rTRC", "gTRC", "bTRC"]
+    val bodies = [
+        descTag("sRGB IEC61966-2.1"),
+        textTag("No copyright, use freely"),
+        xyzTag(0.9642, 1.0, 0.8249),
+        xyzTag(0.4360747, 0.2225045, 0.0139322),
+        xyzTag(0.3850649, 0.7168786, 0.0971045),
+        xyzTag(0.1430804, 0.0606169, 0.7139259),
+        curve, curve, curve
+    ]
+    val table = byteBuffer()
+    table.pdfAppendU32(tags.size)
+    val data = byteBuffer()
+    val dataStart = 128 + 4 + tags.size * 12
+    var curveAt = -1
+    for (i in 0 until tags.size) {
+        val shared = i >= 6
+        var at = dataStart + data.size()
+        if (shared && curveAt >= 0) at = curveAt
+        else {
+            if (shared) curveAt = at
+            data.appendText(bodies[i])
+            while (data.size() % 4 != 0) data.appendByteValue(0)
+        }
+        table.appendText(tags[i])
+        table.pdfAppendU32(at)
+        table.pdfAppendU32(bodies[i].size)
+    }
+    val total = dataStart + data.size()
+    val header = byteBuffer()
+    header.pdfAppendU32(total)
+    header.appendText("\0\0\0\0")
+    header.pdfAppendU32(0x02400000)
+    header.appendText("mntrRGB XYZ ")
+    header.pdfAppendU16(2026)
+    header.pdfAppendU16(1)
+    header.pdfAppendU16(1)
+    header.appendText("\0\0\0\0\0\0")
+    header.appendText("acsp")
+    header.appendText("\0".repeat(4 + 4 + 4 + 4 + 8 + 4))
+    header.pdfAppendU32(s15(0.9642))
+    header.pdfAppendU32(s15(1.0))
+    header.pdfAppendU32(s15(0.8249))
+    header.appendText("\0".repeat(128 - header.size()))
+    header.toText() + table.toText() + data.toText()
+}

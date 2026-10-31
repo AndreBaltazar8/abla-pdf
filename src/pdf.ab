@@ -3,3 +3,8 @@
 export import "util.ab"
 export import "inflate.ab"
 export import "deflate.ab"
+export import "encoding_data.ab"
+export import "ttf.ab"
+export import "image.ab"
+export import "icc.ab"
+export import "writer.ab"
