@@ -5,23 +5,26 @@ pure Abla with no native dependencies. Mozilla Public License 2.0.
 
 ```abla
 import "abla/fs"
-import github("AndreBaltazar8/abla-pdf") as pdf
+import github("AndreBaltazar8/abla-pdf")
 
 fun main: int {
-    val doc = pdf.PdfDocument(title = "Fatura", author = "André")
+    val doc = PdfDocument(title = "Fatura", author = "André")
     val font = doc.embedFont(path("DejaVuSans.ttf").readText())
     if (!font.ok) return 1
-    val page = pdf.PdfPage()
+    val page = PdfPage()
     page.text(font, 14.0, 50.0, 780.0, "São João: ação, coração, 100 €")
     doc.addPage(page)
     path("out.pdf").writeText(doc.toBytes())
 
-    val reader = pdf.pdfOpen(path("out.pdf").readText())
+    val reader = pdfOpen(path("out.pdf").readText())
     if (!reader.ok) return 2
     print(reader.pageText(0))
     0
 }
 ```
+
+Import it without an alias: today an alias doesn't reach what the entry module passes on
+with `export import`. All public names start with `Pdf` or `pdf`, so they won't clash.
 
 ## Generating
 
