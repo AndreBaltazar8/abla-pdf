@@ -1,0 +1,64 @@
+// Compares PNG decoding with what Pillow reads from the same files, which
+// tools/test-corpus.sh generates, and checks JPEG headers. Skipped when not generated.
+
+import "abla/test"
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "../src/pdf.ab"
+
+fun checkPng(dir: string, name: string): void {
+    val decoded = pdfDecodePng(path("$dir/$name.png").readText())
+    expect(decoded.ok, "$name decodes: ${decoded.error}")
+    if (!decoded.ok) return
+    val expected = path("$dir/$name.rgba").readText()
+    expectEqual(decoded.width * decoded.height * 4, expected.size, "$name size")
+    var mismatches = 0
+    for (i in 0 until decoded.width * decoded.height) {
+        val c = decoded.components
+        for (k in 0 until 3) {
+            val mine = if (c == 1) decoded.samples[i] else decoded.samples[i * 3 + k]
+            if (mine != expected[i * 4 + k]) mismatches = mismatches + 1
+        }
+        val alpha = if (decoded.alpha.size > 0) decoded.alpha[i] else 255
+        if (alpha != expected[i * 4 + 3]) mismatches = mismatches + 1
+    }
+    expectEqual(mismatches, 0, "$name pixels")
+    return
+}
+
+fun main: int {
+    val dir = "tests/corpus/generated/images"
+    if (!path(dir).exists()) {
+        println("images not generated, skipped: run tools/test-corpus.sh")
+        return testsPassed()
+    }
+    for (name in ["rgb", "rgba", "gray", "gray-alpha", "palette", "one-bit", "gray16", "interlaced"]) checkPng(dir, name)
+    val jpeg = pdfReadJpeg(path("$dir/photo.jpg").readText())
+    expect(jpeg.ok && jpeg.width == 64 && jpeg.height == 48 && jpeg.components == 3, "jpeg header")
+    expectEqual(pdfReadJpeg(path("$dir/photo-gray.jpg").readText()).components, 1, "gray jpeg")
+    val cmyk = pdfReadJpeg(path("$dir/photo-cmyk.jpg").readText())
+    expect(cmyk.components == 4 && cmyk.invertedCmyk, "cmyk jpeg")
+
+    // Written into a PDF and read back, the JPEG bytes stay untouched.
+    val doc = PdfDocument()
+    val file = path("$dir/photo.jpg").readText()
+    val image = doc.addJpeg(file)
+    val page = PdfPage()
+    page.image(image, 10.0, 10.0, 64.0, 48.0)
+    page.image(doc.addPng(path("$dir/rgba.png").readText()), 100.0, 10.0, 64.0, 48.0)
+    page.image(doc.addPng(path("$dir/palette.png").readText()), 200.0, 10.0, 64.0, 48.0)
+    page.image(doc.addJpeg(path("$dir/photo-cmyk.jpg").readText()), 300.0, 10.0, 64.0, 48.0)
+    doc.addPage(page)
+    val bytes = doc.toBytes()
+    path("build/generated").createDirectories()
+    path("build/generated/images.pdf").writeText(bytes)
+    val r = pdfOpen(bytes)
+    val placed = r.pageImages(0)
+    expectEqual(placed.size, 4, "four images")
+    val data = r.imageData(placed[0])
+    expectEqual(data.encoding, "jpeg", "jpeg encoding")
+    expect(data.data == file, "jpeg bytes unchanged")
+    expect(placed[1].hasSoftMask, "png alpha becomes a soft mask")
+    testsPassed()
+}

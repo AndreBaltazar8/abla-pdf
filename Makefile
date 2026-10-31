@@ -14,11 +14,13 @@ test-in-shell:
 # qpdf, poppler, ghostscript and veraPDF on generated files.
 external: test
 	$(TOOLS) --run tools/check-generated.sh
+	nix-shell $(ABLAC_DIR)/shell.nix --run '$(COMPILER) build examples/invoice.ab -o build/invoice'
+	$(TOOLS) --run tools/check-fonts.sh
 
 # The reader against files from other producers, and fuzzing over those files.
 corpus:
 	tools/test-corpus.sh
-	nix-shell $(ABLAC_DIR)/shell.nix --run '$(COMPILER) test tests/corpus_test.ab tests/fuzz_test.ab'
+	nix-shell $(ABLAC_DIR)/shell.nix --run '$(COMPILER) test tests/corpus_test.ab tests/image_test.ab tests/fuzz_test.ab'
 
 # Signatures with a throwaway certificate, checked by pdfsig, openssl and pyHanko.
 signatures: test

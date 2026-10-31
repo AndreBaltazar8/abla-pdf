@@ -320,6 +320,57 @@ def hand_files():
         fonts_doc.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /X /ToUnicode 5 0 R >>")
     write("hostile-many-cmaps", assemble(fonts_doc))
 
+def image_files():
+    """Images with the pixels Pillow reads from them, for tests/image_test.ab."""
+    from PIL import Image
+    d = os.path.join(out, "images")
+    os.makedirs(d, exist_ok=True)
+    w, h = 13, 7
+    rgb = Image.new("RGB", (w, h))
+    rgb.putdata([(x * 19, y * 35, (x + y) * 12) for y in range(h) for x in range(w)])
+    rgba = Image.new("RGBA", (w, h))
+    rgba.putdata([(x * 19, y * 35, 100, (x * y * 7) & 255) for y in range(h) for x in range(w)])
+    variants = {
+        "rgb": rgb,
+        "rgba": rgba,
+        "gray": rgb.convert("L"),
+        "gray-alpha": rgba.convert("LA"),
+        "palette": rgb.convert("P", palette=Image.ADAPTIVE, colors=16),
+        "one-bit": rgb.convert("1"),
+    }
+    def record(name, image):
+        image = image.convert("RGBA")
+        open(os.path.join(d, name + ".rgba"), "wb").write(image.tobytes())
+    for name, image in variants.items():
+        image.save(os.path.join(d, name + ".png"))
+        record(name, Image.open(os.path.join(d, name + ".png")))
+    gray16 = Image.new("I;16", (w, h))
+    gray16.putdata([x * 5000 for y in range(h) for x in range(w)])
+    gray16.save(os.path.join(d, "gray16.png"))
+    # Pillow reduces 16-bit to its top byte with a right shift, as we do.
+    open(os.path.join(d, "gray16.rgba"), "wb").write(bytes(
+        v for y in range(h) for x in range(w) for v in ((x * 5000) >> 8, (x * 5000) >> 8, (x * 5000) >> 8, 255)))
+    # Adam7, which Pillow reads but doesn't write.
+    passes = [(0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2)]
+    raw = bytearray()
+    pixels = rgb.tobytes()
+    for x0, y0, dx, dy in passes:
+        for y in range(y0, h, dy):
+            row = bytearray()
+            for x in range(x0, w, dx):
+                row += pixels[(y * w + x) * 3:(y * w + x) * 3 + 3]
+            if row:
+                raw.append(0)
+                raw += row
+    def chunk(t, b):
+        return struct.pack(">I", len(b)) + t + b + struct.pack(">I", zlib.crc32(t + b))
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 1)) + chunk(b"IDAT", zlib.compress(bytes(raw))) + chunk(b"IEND", b"")
+    open(os.path.join(d, "interlaced.png"), "wb").write(png)
+    record("interlaced", Image.open(os.path.join(d, "interlaced.png")))
+    rgb.resize((64, 48)).save(os.path.join(d, "photo.jpg"), quality=90)
+    rgb.resize((64, 48)).convert("L").save(os.path.join(d, "photo-gray.jpg"))
+    rgb.resize((64, 48)).convert("CMYK").save(os.path.join(d, "photo-cmyk.jpg"))
+
 def describe():
     """What poppler and qpdf say about each file, for the reader to match."""
     from pypdf import PdfReader
@@ -367,4 +418,5 @@ transforms()
 encrypted()
 incremental()
 hand_files()
+image_files()
 describe()
