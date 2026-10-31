@@ -465,7 +465,7 @@ class PdfStoredPage(
     val links: array<string>
 )
 
-class ObjectSink(
+class PdfObjectSink(
     val bodies: array<string>,
     val streams: array<bool>
 ) {
@@ -728,14 +728,14 @@ class PdfDocument(
         y - height
     }
 
-    fun filtered(var sink: ObjectSink, entries: string, data: string): int {
+    fun filtered(var sink: PdfObjectSink, entries: string, data: string): int {
         if (compress && data.size > 32) {
             return sink.addStream("$entries /Filter /FlateDecode", pdfZlibCompress(data))
         }
         sink.addStream(entries, data)
     }
 
-    fun writeFont(var sink: ObjectSink, id: int): int {
+    fun writeFont(var sink: PdfObjectSink, id: int): int {
         val stored = fonts[id]
         val t = stored.font.truetype
         if (t == null) {
@@ -781,7 +781,7 @@ class PdfDocument(
         )
     }
 
-    fun writeImage(var sink: ObjectSink, id: int): int {
+    fun writeImage(var sink: PdfObjectSink, id: int): int {
         val img = images[id]
         var entries = "/Type /XObject /Subtype /Image /Width ${img.width} /Height ${img.height} /BitsPerComponent 8 /ColorSpace "
         entries = entries + (if (img.components == 1) "/DeviceGray" else if (img.components == 3) "/DeviceRGB" else "/DeviceCMYK")
@@ -850,7 +850,7 @@ class PdfDocument(
             warnings.append("document has no pages; writing one blank page")
             addPage(PdfPage())
         }
-        val sink = ObjectSink([], [])
+        val sink = PdfObjectSink([], [])
         val catalogRef = sink.reserve()
         val pagesRef = sink.reserve()
         val fontRefs = filledArray(fonts.size, 0)
@@ -911,7 +911,7 @@ class PdfDocument(
         if (objectStreams) writeCompact(sink, catalogRef, infoRef) else writeClassic(sink, catalogRef, infoRef)
     }
 
-    fun writeClassic(sink: ObjectSink, catalogRef: int, infoRef: int): string {
+    fun writeClassic(sink: PdfObjectSink, catalogRef: int, infoRef: int): string {
         val out = byteBuffer()
         out.appendText("%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
         val offsets: array<int> = []
@@ -934,7 +934,7 @@ class PdfDocument(
         out.toText()
     }
 
-    fun writeCompact(sink: ObjectSink, catalogRef: int, infoRef: int): string {
+    fun writeCompact(sink: PdfObjectSink, catalogRef: int, infoRef: int): string {
         val out = byteBuffer()
         out.appendText("%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
         val count = sink.bodies.size
