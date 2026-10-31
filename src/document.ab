@@ -1,0 +1,261 @@
+// What a document says about itself and its pages: metadata, page geometry, form
+// fields and annotations.
+
+import "abla/bytes"
+import "abla/date"
+import "abla/float"
+import "abla/text"
+
+class PdfMetadata(
+    val title: string,
+    val author: string,
+    val subject: string,
+    val keywords: string,
+    val creator: string,
+    val producer: string,
+    // As written, such as D:20260101120000Z; see pdfParseDate.
+    val creationDate: string,
+    val modificationDate: string
+)
+
+class PdfRect(val left: f64, val bottom: f64, val right: f64, val top: f64) {
+    fun width(): f64 = right - left
+    fun height(): f64 = top - bottom
+}
+
+class PdfFormField(
+    // The fully qualified name: parent names joined with dots.
+    val name: string,
+    // "text", "button", "choice", "signature" or "" when unknown.
+    val kind: string,
+    val value: string,
+    val defaultValue: string,
+    val flags: int,
+    // For a choice: the export values.
+    val options: array<string>,
+    // The page of its widget, -1 when not known, and where the widget is.
+    val page: int,
+    val rect: PdfRect
+)
+
+class PdfAnnotation(
+    val subtype: string,
+    val rect: PdfRect,
+    val contents: string,
+    // The /T entry: a markup's author, or a widget's field name.
+    val title: string,
+    // A link's target, when it opens a URI.
+    val uri: string,
+    val flags: int
+)
+
+// A PDF text string as UTF-8: UTF-16 or UTF-8 with a byte order mark, otherwise
+// PDFDocEncoding.
+fun pdfDecodeTextString(raw: string): string {
+    if (raw.size >= 2 && raw[0] == 0xfe && raw[1] == 0xff) return pdfUtf16ToUtf8(raw, 2)
+    if (raw.size >= 2 && raw[0] == 0xff && raw[1] == 0xfe) return pdfUtf16ToUtf8(raw, 2, true)
+    if (raw.size >= 3 && raw[0] == 0xef && raw[1] == 0xbb && raw[2] == 0xbf) return raw.slice(3, raw.size)
+    val out = byteBuffer()
+    for (b in raw) {
+        val cp = PDF_ENCODING_PDFDOC[b]
+        if (cp != 0) out.pdfAppendUtf8(cp)
+    }
+    out.toText()
+}
+
+// Milliseconds since 1970 for a PDF date (D:YYYYMMDDHHmmSSOHH'mm'), null if the
+// text isn't one. Fields after the year may be left out.
+fun pdfParseDate(text: string): int? {
+    val s = if (text.startsWith("D:")) text.slice(2, text.size) else text
+    var at = 0
+    val field = { width: int, fallback: int ->
+        var v = fallback
+        if (at + width <= s.size) {
+            var parsed = 0
+            var good = true
+            for (i in 0 until width) {
+                val c = s[at + i]
+                if (c < 48 || c > 57) good = false
+                else parsed = parsed * 10 + (c - 48)
+            }
+            if (good) {
+                v = parsed
+                at = at + width
+            }
+        }
+        v
+    }
+    val year = field(4, -1)
+    if (year < 0) return null
+    val month = field(2, 1)
+    val day = field(2, 1)
+    val hour = field(2, 0)
+    val minute = field(2, 0)
+    val second = field(2, 0)
+    if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 60) return null
+    var ms = utcMilliseconds(year, month, day, hour, minute, second)
+    if (at < s.size && (s[at] == 43 || s[at] == 45)) {
+        val sign = if (s[at] == 43) 1 else -1
+        at = at + 1
+        val offsetHours = field(2, 0)
+        if (at < s.size && s[at] == 39) at = at + 1
+        val offsetMinutes = field(2, 0)
+        ms = ms - sign * (offsetHours * 3600000 + offsetMinutes * 60000)
+    }
+    ms
+}
+
+fun PdfReader.metadata(): PdfMetadata {
+    val info = getResolved(trailer, "Info")
+    val read = { key: string -> pdfDecodeTextString(stringOf(get(info, key))) }
+    PdfMetadata(read("Title"), read("Author"), read("Subject"), read("Keywords"), read("Creator"),
+        read("Producer"), stringOf(get(info, "CreationDate")), stringOf(get(info, "ModDate")))
+}
+
+// The XMP packet of the document, "" without one.
+fun PdfReader.xmpMetadata(): string {
+    val stream = getResolved(root, "Metadata")
+    if (kinds[stream] != PDF_STREAM) return ""
+    decodeStream(stream)
+}
+
+fun PdfReader.pageCount(): int = pages.size
+
+private fun PdfReader.rectOf(id: int): PdfRect {
+    val v = resolve(id)
+    if (arraySize(v) < 4) return PdfRect(0.0, 0.0, 0.0, 0.0)
+    val a = numberOf(arrayAt(v, 0))
+    val b = numberOf(arrayAt(v, 1))
+    val c = numberOf(arrayAt(v, 2))
+    val d = numberOf(arrayAt(v, 3))
+    PdfRect(if (a < c) a else c, if (b < d) b else d, if (a < c) c else a, if (b < d) d else b)
+}
+
+// The page's media box; A4 when the file gives none.
+fun PdfReader.pageMediaBox(index: int): PdfRect {
+    if (index < 0 || index >= pages.size) return PdfRect(0.0, 0.0, 0.0, 0.0)
+    val box = pages[index].mediaBox
+    if (arraySize(box) < 4) return PdfRect(0.0, 0.0, pdfA4Width, pdfA4Height)
+    rectOf(box)
+}
+
+// The visible area: the crop box when there is one.
+fun PdfReader.pageCropBox(index: int): PdfRect {
+    if (index < 0 || index >= pages.size) return PdfRect(0.0, 0.0, 0.0, 0.0)
+    val box = pages[index].cropBox
+    if (arraySize(box) < 4) return pageMediaBox(index)
+    rectOf(box)
+}
+
+// Clockwise rotation in degrees, one of 0, 90, 180, 270.
+fun PdfReader.pageRotation(index: int): int {
+    if (index < 0 || index >= pages.size) return 0
+    val r = pages[index].rotate % 360
+    if (r < 0) r + 360 else r
+}
+
+fun PdfReader.pageAnnotations(index: int): array<PdfAnnotation> {
+    val out: array<PdfAnnotation> = []
+    if (index < 0 || index >= pages.size) return out
+    val list = getResolved(pages[index].dict, "Annots")
+    for (i in 0 until arraySize(list)) {
+        val a = resolve(arrayAt(list, i))
+        if (dictOf(a) != 0 && out.size < 100000) {
+            var uri = ""
+            val action = getResolved(a, "A")
+            if (nameOf(get(action, "S")) == "URI") uri = stringOf(get(action, "URI"))
+            out.append(PdfAnnotation(
+                nameOf(get(a, "Subtype")), rectOf(get(a, "Rect")),
+                pdfDecodeTextString(stringOf(get(a, "Contents"))),
+                pdfDecodeTextString(stringOf(get(a, "T"))),
+                uri, intOf(get(a, "F"), 0)
+            ))
+        }
+    }
+    out
+}
+
+private fun PdfReader.textOrName(id: int): string {
+    val v = resolve(id)
+    if (kinds[v] == PDF_STRING) return pdfDecodeTextString(texts[first[v]])
+    if (kinds[v] == PDF_NAME) return texts[first[v]]
+    if (kinds[v] == PDF_STREAM) return pdfDecodeTextString(decodeStream(v))
+    ""
+}
+
+private fun PdfReader.walkField(
+    reference: int, parentName: string, inheritedType: string, inheritedValue: int,
+    inheritedDefault: int, inheritedFlags: int, depth: int,
+    var seen: Map<int, int>, pageOf: Map<int, int>, var out: array<PdfFormField>
+): void {
+    if (depth > options.maxDepth || out.size >= 100000) return
+    val dict = resolve(reference)
+    if (dictOf(dict) == 0) return
+    if (seen.has(dict)) return
+    seen.set(dict, 1)
+    val partial = pdfDecodeTextString(stringOf(get(dict, "T")))
+    val name = if (partial == "") parentName else if (parentName == "") partial else "$parentName.$partial"
+    val ownType = nameOf(get(dict, "FT"))
+    val type = if (ownType != "") ownType else inheritedType
+    val value = if (get(dict, "V") != 0) get(dict, "V") else inheritedValue
+    val fallback = if (get(dict, "DV") != 0) get(dict, "DV") else inheritedDefault
+    val flags = if (get(dict, "Ff") != 0) intOf(get(dict, "Ff"), 0) else inheritedFlags
+    val kids = getResolved(dict, "Kids")
+    var fieldKids = 0
+    for (i in 0 until arraySize(kids)) {
+        val kid = resolve(arrayAt(kids, i))
+        if (hasKey(kid, "T")) fieldKids = fieldKids + 1
+    }
+    if (fieldKids > 0) {
+        for (i in 0 until arraySize(kids)) walkField(arrayAt(kids, i), name, type, value, fallback, flags, depth + 1, seen, pageOf, out)
+        return
+    }
+    // A field with widgets as kids, or one merged with its only widget.
+    var widget = dict
+    if (arraySize(kids) > 0) widget = resolve(arrayAt(kids, 0))
+    var rect = PdfRect(0.0, 0.0, 0.0, 0.0)
+    if (hasKey(widget, "Rect")) rect = rectOf(get(widget, "Rect"))
+    val choices: array<string> = []
+    val opt = getResolved(dict, "Opt")
+    for (i in 0 until arraySize(opt)) {
+        if (i < 65536) {
+            val entry = resolve(arrayAt(opt, i))
+            if (kinds[entry] == PDF_ARRAY) choices.append(textOrName(arrayAt(entry, 0)))
+            else choices.append(textOrName(entry))
+        }
+    }
+    val kind = when (type) {
+        "Tx" -> "text"
+        "Btn" -> "button"
+        "Ch" -> "choice"
+        "Sig" -> "signature"
+        else -> ""
+    }
+    var shown = ""
+    val v = resolve(value)
+    if (kinds[v] == PDF_ARRAY) {
+        val parts: array<string> = []
+        for (i in 0 until arraySize(v)) if (i < 4096) parts.append(textOrName(arrayAt(v, i)))
+        shown = textJoin(parts, ", ")
+    } else if (kind != "signature") shown = textOrName(v)
+    out.append(PdfFormField(name, kind, shown, textOrName(fallback), flags, choices, pageOf.get(widget) ?? -1, rect))
+    return
+}
+
+// Every field of the interactive form, an empty list without a form.
+fun PdfReader.formFields(): array<PdfFormField> {
+    val out: array<PdfFormField> = []
+    val form = getResolved(root, "AcroForm")
+    val fields = getResolved(form, "Fields")
+    if (arraySize(fields) == 0) return out
+    val pageOf = Map<int, int>()
+    for (index in 0 until pages.size) {
+        val list = getResolved(pages[index].dict, "Annots")
+        for (i in 0 until arraySize(list)) if (i < 65536) pageOf.set(resolve(arrayAt(list, i)), index)
+    }
+    val seen = Map<int, int>()
+    for (i in 0 until arraySize(fields)) {
+        walkField(arrayAt(fields, i), "", "", 0, 0, 0, 0, seen, pageOf, out)
+    }
+    out
+}

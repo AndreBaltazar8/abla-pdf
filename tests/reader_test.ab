@@ -1,0 +1,164 @@
+import "abla/test"
+import "abla/fs"
+import "abla/text"
+import "abla/bytes"
+import "../src/pdf.ab"
+
+fun generatedRoundTrips(): void {
+    val font = path("tests/fixtures/DejaVuSans-Latin.ttf").readText()
+    for (mode in 0 until 3) {
+        val doc = PdfDocument(compress = mode != 1, objectStreams = mode == 2, title = "Modo $mode")
+        val f = doc.embedFont(font)
+        val page = PdfPage(400.0, 300.0)
+        page.setFillGray(0.5)
+        page.rect(0.0, 0.0, 10.0, 10.0)
+        page.fill()
+        page.text(f, 10.0, 20.0, 200.0, "ação")
+        page.text(f, 10.0, 200.0, 200.0, "mesma linha")
+        page.save()
+        page.transform(2.0, 0.0, 0.0, 2.0, 10.0, 10.0)
+        page.text(f, 10.0, 5.0, 20.0, "dobro")
+        page.restore()
+        page.save()
+        page.translate(50.0, 100.0)
+        page.rotate(90.0)
+        page.text(f, 10.0, 0.0, 0.0, "vertical")
+        page.restore()
+        val image = doc.addRawImage(4, 2, 3, "abc".repeat(8))
+        page.image(image, 100.0, 50.0, 40.0, 20.0)
+        page.link(10.0, 10.0, 50.0, 10.0, "https://example.com/a")
+        doc.addPage(page)
+        page.clear()
+        page.text(f, 10.0, 20.0, 100.0, "segunda")
+        doc.addPage(page)
+        val r = pdfOpen(doc.toBytes())
+        expect(r.ok, "mode $mode opens")
+        expectEqual(r.pageCount(), 2, "mode $mode pages")
+        expectEqual(r.metadata().title, "Modo $mode", "mode $mode title")
+        expectEqual(r.pageMediaBox(0).width(), 400.0, "mode $mode box")
+        val items = r.pageTextItems(0)
+        expectEqual(items.size, 4, "mode $mode items")
+        expectEqual(items[2].text, "dobro", "mode $mode scaled text")
+        expectEqual(items[2].x, 20.0, "mode $mode scaled x")
+        expectEqual(items[2].y, 50.0, "mode $mode scaled y")
+        expectEqual(items[2].fontSize, 20.0, "mode $mode scaled size")
+        expectEqual(items[3].angle, 90.0, "mode $mode angle")
+        expect(r.pageText(0).contains("ação mesma linha"), "mode $mode line assembly: ${r.pageText(0)}")
+        val images = r.pageImages(0)
+        expectEqual(images.size, 1, "mode $mode image")
+        expectEqual(images[0].x, 100.0, "mode $mode image x")
+        expectEqual(images[0].drawWidth, 40.0, "mode $mode image width")
+        expectEqual(images[0].width, 4, "mode $mode image pixels")
+        val data = r.imageData(images[0])
+        expectEqual(data.encoding, "raw", "mode $mode raw")
+        expectEqual(data.data, "abc".repeat(8), "mode $mode pixels")
+        val notes = r.pageAnnotations(0)
+        expectEqual(notes.size, 1, "mode $mode link")
+        expectEqual(notes[0].uri, "https://example.com/a", "mode $mode uri")
+        expectEqual(r.pageText(1), "segunda\n", "mode $mode second page")
+        expectEqual(r.pageText(99), "", "page out of range")
+    }
+    return
+}
+
+// Assembles a one-page file around a content stream, offsets computed.
+fun oneObjectFile(objects: array<string>): string {
+    val out = byteBuffer()
+    out.appendText("%PDF-1.4\n")
+    val offsets: array<int> = []
+    for (i in 0 until objects.size) {
+        offsets.append(out.size())
+        out.appendText("${i + 1} 0 obj\n${objects[i]}\nendobj\n")
+    }
+    val at = out.size()
+    out.appendText("xref\n0 ${objects.size + 1}\n0000000000 65535 f \n")
+    for (o in offsets) out.appendText("${"$o".padStart(10, "0")} 00000 n \n")
+    out.appendText("trailer\n<< /Size ${objects.size + 1} /Root 1 0 R >>\nstartxref\n$at\n%%EOF\n")
+    out.toText()
+}
+
+fun withContent(content: string, fontEntry: string = "/Encoding /WinAnsiEncoding"): string = oneObjectFile([
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 300] /Rotate 90 /Resources << /Font << /F1 5 0 R >> >> >>",
+    "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+    "<< /Length ${content.size} >>\nstream\n$content\nendstream",
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica $fontEntry >>"
+])
+
+fun handWritten(): void {
+    val r = pdfOpen(withContent("BT /F1 12 Tf 14 TL 20 250 Td (First) Tj T* (Second) Tj (Third) ' [(Ke) 120 (rn) -300 (ed)] TJ ET"))
+    expect(r.ok, "hand file opens")
+    expectEqual(r.pageRotation(0), 90, "inherited rotation")
+    expectEqual(r.pageMediaBox(0).height(), 300.0, "inherited box")
+    val items = r.pageTextItems(0)
+    expectEqual(items[0].y, 250.0, "first baseline")
+    expectEqual(items[1].y, 236.0, "T* moves by the leading")
+    expectEqual(items[2].y, 222.0, "quote moves by the leading")
+    expect(items[2].x == 20.0 && items[3].x > 20.0, "Ke follows Third")
+    // Helvetica widths come from the standard font metrics: K 667, e 556.
+    expect(items[4].x > items[3].x, "TJ adjustment moves on")
+    val encoded = pdfOpen(withContent(
+        "BT /F1 12 Tf 10 10 Td (\\101\\353) Tj ET",
+        "/Encoding << /BaseEncoding /WinAnsiEncoding /Differences [65 /Euro /eacute /uni00E7] >>"
+    ))
+    expectEqual(encoded.pageText(0), "€ë\n", "differences and octal escapes")
+    val hex = pdfOpen(withContent("BT /F1 12 Tf 10 10 Td <48 65 6C6C 6F> Tj ET"))
+    expectEqual(hex.pageText(0), "Hello\n", "hex string")
+    val tu = pdfOpen(oneObjectFile([
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+        "<< /Length 32 >>\nstream\nBT /F1 9 Tf <00010002> Tj ET     \nendstream",
+        "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 7 0 R >>",
+        "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X /DW 500 /W [1 [300] 2 2 700] >>",
+        "<< /Length 113 >>\nstream\n1 begincodespacerange <0000> <FFFF> endcodespacerange 1 beginbfrange <0001> <0002> <00E3> endbfrange\nendcmap     \nendstream"
+    ]))
+    val tuItems = tu.pageTextItems(0)
+    expectEqual(tuItems.size, 1, "cid item")
+    expectEqual(tuItems[0].text, "ãä", "ToUnicode range")
+    expectEqual(tuItems[0].width, 9.0, "W array widths")
+    return
+}
+
+fun garbage(): void {
+    expect(!pdfOpen("").ok, "empty input")
+    expect(!pdfOpen("not a pdf at all").ok, "text input")
+    expect(!pdfOpen("%PDF-1.7\n").ok, "header only")
+    expect(pdfOpen("not a pdf").error != "", "says why")
+    return
+}
+
+fun main: int {
+    val doc = PdfDocument(title = "Ação", author = "André", createdAt = 1767225600000)
+    val font = doc.embedFont(path("tests/fixtures/DejaVuSans-Latin.ttf").readText())
+    val page = PdfPage()
+    page.text(font, 12.0, 100.0, 700.0, "São João")
+    page.text(doc.standardFont("Helvetica"), 10.0, 100.0, 680.0, "coração €5")
+    doc.addPage(page)
+    val r = pdfOpen(doc.toBytes())
+    expect(r.ok, "opens: ${r.error}")
+    expectEqual(r.pageCount(), 1, "pages")
+    expectEqual(r.metadata().title, "Ação", "title")
+    expectEqual(r.metadata().author, "André", "author")
+    val items = r.pageTextItems(0)
+    expectEqual(items.size, 2, "items")
+    expectEqual(items[0].text, "São João", "text 1")
+    expectEqual(items[0].x, 100.0, "x")
+    expectEqual(items[0].y, 700.0, "y")
+    expectEqual(items[1].text, "coração €5", "text 2")
+    expectEqual(r.pageText(0), "São João\ncoração €5\n", "page text")
+    expect(items[0].width > 40.0 && items[0].width < 70.0, "width")
+    expectEqual(items[0].fontSize, 12.0, "font size")
+    expect(items[1].fontName == "Helvetica", "font name")
+    expect(items[0].fontName.contains("DejaVu"), "subset tag stripped")
+    expectEqual(pdfParseDate("D:20260101120000Z") ?? -1, 1767268800000, "date")
+    expectEqual(pdfParseDate("D:20260101130000+01'00'") ?? -1, 1767268800000, "date with offset")
+    expect(pdfParseDate("nonsense") == null, "bad date")
+    expectEqual(pdfParseDate(r.metadata().creationDate) ?? -1, 1767225600000, "round trip date")
+    expect(r.xmpMetadata().contains("Ação"), "xmp")
+
+    generatedRoundTrips()
+    handWritten()
+    garbage()
+    testsPassed()
+}

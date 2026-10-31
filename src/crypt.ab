@@ -1,0 +1,357 @@
+// The ciphers and hashes of the PDF standard security handler that the stdlib
+// doesn't have: RC4, AES and SHA-384/512. Decrypting files is their only use, so
+// constant time isn't a goal here.
+
+import "abla/bytes"
+import "abla/crypto"
+
+fun pdfRc4(key: string, data: string): string {
+    if (key.size == 0) return data
+    val s = filledArray(256, 0)
+    for (i in 0 until 256) s[i] = i
+    var j = 0
+    for (i in 0 until 256) {
+        j = (j + s[i] + key[i % key.size]) & 255
+        val t = s[i]
+        s[i] = s[j]
+        s[j] = t
+    }
+    val out = byteBuffer()
+    var a = 0
+    var b = 0
+    for (byte in data) {
+        a = (a + 1) & 255
+        b = (b + s[a]) & 255
+        val t = s[a]
+        s[a] = s[b]
+        s[b] = t
+        out.appendByteValue(byte ^ s[(s[a] + s[b]) & 255])
+    }
+    out.toText()
+}
+
+private fun xtime(v: int): int {
+    val doubled = v << 1
+    (if (doubled >= 256) doubled ^ 0x11b else doubled) & 255
+}
+
+private fun gmul(a: int, b: int): int {
+    var x = a
+    var y = b
+    var r = 0
+    while (y > 0) {
+        if ((y & 1) != 0) r = r ^ x
+        x = xtime(x)
+        y = y >> 1
+    }
+    r
+}
+
+private fun buildSbox(): array<int> {
+    val sbox = filledArray(256, 0)
+    var p = 1
+    var q = 1
+    var going = true
+    while (going) {
+        p = (p ^ xtime(p)) & 255
+        q = (q ^ (q << 1)) & 255
+        q = (q ^ (q << 2)) & 255
+        q = (q ^ (q << 4)) & 255
+        if ((q & 0x80) != 0) q = q ^ 0x09
+        val rot = q ^ rotl8(q, 1) ^ rotl8(q, 2) ^ rotl8(q, 3) ^ rotl8(q, 4)
+        sbox[p] = rot ^ 0x63
+        if (p == 1) going = false
+    }
+    sbox[0] = 0x63
+    sbox
+}
+
+private fun rotl8(v: int, n: int): int = ((v << n) | (v >> (8 - n))) & 255
+
+private fun invert(box: array<int>): array<int> {
+    val out = filledArray(256, 0)
+    for (i in 0 until 256) out[box[i]] = i
+    out
+}
+
+private fun mulTable(n: int): array<int> {
+    val out = filledArray(256, 0)
+    for (i in 0 until 256) out[i] = gmul(i, n)
+    out
+}
+
+private val SBOX = buildSbox()
+private val INV_SBOX = invert(SBOX)
+private val MUL2 = mulTable(2)
+private val MUL3 = mulTable(3)
+private val MUL9 = mulTable(9)
+private val MUL11 = mulTable(11)
+private val MUL13 = mulTable(13)
+private val MUL14 = mulTable(14)
+
+private fun expandKey(key: string): array<int> {
+    val nk = key.size / 4
+    val rounds = nk + 6
+    val total = 16 * (rounds + 1)
+    val w = filledArray(total, 0)
+    for (i in 0 until key.size) w[i] = key[i]
+    var rcon = 1
+    var at = key.size
+    while (at < total) {
+        var t0 = w[at - 4]
+        var t1 = w[at - 3]
+        var t2 = w[at - 2]
+        var t3 = w[at - 1]
+        if (at % key.size == 0) {
+            val first = t0
+            t0 = SBOX[t1] ^ rcon
+            t1 = SBOX[t2]
+            t2 = SBOX[t3]
+            t3 = SBOX[first]
+            rcon = xtime(rcon)
+        } else if (nk > 6 && at % key.size == 16) {
+            t0 = SBOX[t0]
+            t1 = SBOX[t1]
+            t2 = SBOX[t2]
+            t3 = SBOX[t3]
+        }
+        w[at] = w[at - key.size] ^ t0
+        w[at + 1] = w[at - key.size + 1] ^ t1
+        w[at + 2] = w[at - key.size + 2] ^ t2
+        w[at + 3] = w[at - key.size + 3] ^ t3
+        at = at + 4
+    }
+    w
+}
+
+private fun encryptBlock(w: array<int>, var s: array<int>, var t: array<int>): void {
+    val rounds = w.size / 16 - 1
+    for (i in 0 until 16) s[i] = s[i] ^ w[i]
+    for (round in 1 until rounds + 1) {
+        for (c in 0 until 4) {
+            val c0 = c * 4
+            val a = SBOX[s[c0]]
+            val b = SBOX[s[(c0 + 5) & 15]]
+            val d = SBOX[s[(c0 + 10) & 15]]
+            val e = SBOX[s[(c0 + 15) & 15]]
+            if (round < rounds) {
+                t[c0] = MUL2[a] ^ MUL3[b] ^ d ^ e
+                t[c0 + 1] = a ^ MUL2[b] ^ MUL3[d] ^ e
+                t[c0 + 2] = a ^ b ^ MUL2[d] ^ MUL3[e]
+                t[c0 + 3] = MUL3[a] ^ b ^ d ^ MUL2[e]
+            } else {
+                t[c0] = a
+                t[c0 + 1] = b
+                t[c0 + 2] = d
+                t[c0 + 3] = e
+            }
+        }
+        val base = round * 16
+        for (i in 0 until 16) s[i] = t[i] ^ w[base + i]
+    }
+    return
+}
+
+private fun decryptBlock(w: array<int>, var s: array<int>, var t: array<int>): void {
+    val rounds = w.size / 16 - 1
+    val top = rounds * 16
+    for (i in 0 until 16) s[i] = s[i] ^ w[top + i]
+    var round = rounds - 1
+    while (round >= 0) {
+        // Inverse ShiftRows and SubBytes, then the round key, then InvMixColumns.
+        for (c in 0 until 4) {
+            val c0 = c * 4
+            t[c0] = INV_SBOX[s[c0]]
+            t[c0 + 1] = INV_SBOX[s[(c0 + 13) & 15]]
+            t[c0 + 2] = INV_SBOX[s[(c0 + 10) & 15]]
+            t[c0 + 3] = INV_SBOX[s[(c0 + 7) & 15]]
+        }
+        val base = round * 16
+        for (i in 0 until 16) t[i] = t[i] ^ w[base + i]
+        if (round > 0) {
+            for (c in 0 until 4) {
+                val c0 = c * 4
+                val a = t[c0]
+                val b = t[c0 + 1]
+                val d = t[c0 + 2]
+                val e = t[c0 + 3]
+                s[c0] = MUL14[a] ^ MUL11[b] ^ MUL13[d] ^ MUL9[e]
+                s[c0 + 1] = MUL9[a] ^ MUL14[b] ^ MUL11[d] ^ MUL13[e]
+                s[c0 + 2] = MUL13[a] ^ MUL9[b] ^ MUL14[d] ^ MUL11[e]
+                s[c0 + 3] = MUL11[a] ^ MUL13[b] ^ MUL9[d] ^ MUL14[e]
+            }
+        } else for (i in 0 until 16) s[i] = t[i]
+        round = round - 1
+    }
+    return
+}
+
+// AES-CBC over whole blocks; a trailing partial block is dropped.
+fun pdfAesCbcDecrypt(key: string, iv: string, data: string): string {
+    if (key.size != 16 && key.size != 32 || iv.size != 16) return ""
+    val w = expandKey(key)
+    val previous = filledArray(16, 0)
+    for (i in 0 until 16) previous[i] = iv[i]
+    val s = filledArray(16, 0)
+    val t = filledArray(16, 0)
+    val out = byteBuffer()
+    var at = 0
+    while (at + 16 <= data.size) {
+        for (i in 0 until 16) s[i] = data[at + i]
+        decryptBlock(w, s, t)
+        for (i in 0 until 16) {
+            out.appendByteValue(s[i] ^ previous[i])
+            previous[i] = data[at + i]
+        }
+        at = at + 16
+    }
+    out.toText()
+}
+
+fun pdfAesCbcEncrypt(key: string, iv: string, data: string): string {
+    if (key.size != 16 && key.size != 32 || iv.size != 16) return ""
+    val w = expandKey(key)
+    val previous = filledArray(16, 0)
+    for (i in 0 until 16) previous[i] = iv[i]
+    val s = filledArray(16, 0)
+    val t = filledArray(16, 0)
+    val out = byteBuffer()
+    var at = 0
+    while (at + 16 <= data.size) {
+        for (i in 0 until 16) s[i] = data[at + i] ^ previous[i]
+        encryptBlock(w, s, t)
+        for (i in 0 until 16) {
+            out.appendByteValue(s[i])
+            previous[i] = s[i]
+        }
+        at = at + 16
+    }
+    out.toText()
+}
+
+// Decrypts a PDF AES string or stream: the IV comes first, PKCS#7 padding last.
+fun pdfAesDecryptPayload(key: string, data: string): string {
+    if (data.size < 32) return ""
+    val plain = pdfAesCbcDecrypt(key, data.slice(0, 16), data.slice(16, data.size))
+    if (plain.size == 0) return ""
+    val pad = plain[plain.size - 1]
+    if (pad >= 1 && pad <= 16 && pad <= plain.size) plain.slice(0, plain.size - pad) else plain
+}
+
+private fun k512(): array<int> = [
+    0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc, 0x3956c25bf348b538,
+    0x59f111f1b605d019, 0x923f82a4af194f9b, 0xab1c5ed5da6d8118, 0xd807aa98a3030242, 0x12835b0145706fbe,
+    0x243185be4ee4b28c, 0x550c7dc3d5ffb4e2, 0x72be5d74f27b896f, 0x80deb1fe3b1696b1, 0x9bdc06a725c71235,
+    0xc19bf174cf692694, 0xe49b69c19ef14ad2, 0xefbe4786384f25e3, 0x0fc19dc68b8cd5b5, 0x240ca1cc77ac9c65,
+    0x2de92c6f592b0275, 0x4a7484aa6ea6e483, 0x5cb0a9dcbd41fbd4, 0x76f988da831153b5, 0x983e5152ee66dfab,
+    0xa831c66d2db43210, 0xb00327c898fb213f, 0xbf597fc7beef0ee4, 0xc6e00bf33da88fc2, 0xd5a79147930aa725,
+    0x06ca6351e003826f, 0x142929670a0e6e70, 0x27b70a8546d22ffc, 0x2e1b21385c26c926, 0x4d2c6dfc5ac42aed,
+    0x53380d139d95b3df, 0x650a73548baf63de, 0x766a0abb3c77b2a8, 0x81c2c92e47edaee6, 0x92722c851482353b,
+    0xa2bfe8a14cf10364, 0xa81a664bbc423001, 0xc24b8b70d0f89791, 0xc76c51a30654be30, 0xd192e819d6ef5218,
+    0xd69906245565a910, 0xf40e35855771202a, 0x106aa07032bbd1b8, 0x19a4c116b8d2d0c8, 0x1e376c085141ab53,
+    0x2748774cdf8eeb99, 0x34b0bcb5e19b48a8, 0x391c0cb3c5c95a63, 0x4ed8aa4ae3418acb, 0x5b9cca4f7763e373,
+    0x682e6ff3d6b2b8a3, 0x748f82ee5defb2fc, 0x78a5636f43172f60, 0x84c87814a1f0ab72, 0x8cc702081a6439ec,
+    0x90befffa23631e28, 0xa4506cebde82bde9, 0xbef9a3f7b2c67915, 0xc67178f2e372532b, 0xca273eceea26619c,
+    0xd186b8c721c0c207, 0xeada7dd6cde0eb1e, 0xf57d4f7fee6ed178, 0x06f067aa72176fba, 0x0a637dc5a2c898a6,
+    0x113f9804bef90dae, 0x1b710b35131c471b, 0x28db77f523047d84, 0x32caab7b40c72493, 0x3c9ebe0a15c9bebc,
+    0x431d67c49c100d4c, 0x4cc5d4becb3e42b6, 0x597f299cfc657e2a, 0x5fcb6fab3ad6faec, 0x6c44198c4a475817
+]
+
+private val K512 = k512()
+
+private fun rotr64(v: int, n: int): int = (v >>> n) | (v << (64 - n))
+
+private fun sha2Big(message: string, init: array<int>, digestBytes: int): string {
+    val h = filledArray(8, 0)
+    for (i in 0 until 8) h[i] = init[i]
+    val padded = byteBuffer()
+    padded.appendText(message)
+    padded.appendByteValue(0x80)
+    val zeros = (239 - message.size % 128 + 128) % 128
+    padded.appendText("\0".repeat(zeros + 8))
+    val bitLength = message.size * 8
+    padded.pdfAppendU32((bitLength >>> 32) & 0xffffffff)
+    padded.pdfAppendU32(bitLength & 0xffffffff)
+    val data = padded.toText()
+    val w = filledArray(80, 0)
+    var at = 0
+    while (at < data.size) {
+        for (t in 0 until 16) w[t] = (pdfU32(data, at + t * 8) << 32) | pdfU32(data, at + t * 8 + 4)
+        for (t in 16 until 80) {
+            val v1 = w[t - 2]
+            val v0 = w[t - 15]
+            val s1 = rotr64(v1, 19) ^ rotr64(v1, 61) ^ (v1 >>> 6)
+            val s0 = rotr64(v0, 1) ^ rotr64(v0, 8) ^ (v0 >>> 7)
+            w[t] = s1 + w[t - 7] + s0 + w[t - 16]
+        }
+        var a = h[0]
+        var b = h[1]
+        var c = h[2]
+        var d = h[3]
+        var e = h[4]
+        var f = h[5]
+        var g = h[6]
+        var hh = h[7]
+        for (t in 0 until 80) {
+            val s1 = rotr64(e, 14) ^ rotr64(e, 18) ^ rotr64(e, 41)
+            val ch = (e & f) ^ (~e & g)
+            val t1 = hh + s1 + ch + K512[t] + w[t]
+            val s0 = rotr64(a, 28) ^ rotr64(a, 34) ^ rotr64(a, 39)
+            val maj = (a & b) ^ (a & c) ^ (b & c)
+            val t2 = s0 + maj
+            hh = g
+            g = f
+            f = e
+            e = d + t1
+            d = c
+            c = b
+            b = a
+            a = t1 + t2
+        }
+        h[0] = h[0] + a
+        h[1] = h[1] + b
+        h[2] = h[2] + c
+        h[3] = h[3] + d
+        h[4] = h[4] + e
+        h[5] = h[5] + f
+        h[6] = h[6] + g
+        h[7] = h[7] + hh
+        at = at + 128
+    }
+    val out = byteBuffer()
+    for (v in h) {
+        out.pdfAppendU32((v >>> 32) & 0xffffffff)
+        out.pdfAppendU32(v & 0xffffffff)
+    }
+    out.toText().slice(0, digestBytes)
+}
+
+fun pdfSha512(message: string): string = sha2Big(message, [
+    0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
+    0x510e527fade682d1, 0x9b05688c2b3e6c1f, 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179
+], 64)
+
+fun pdfSha384(message: string): string = sha2Big(message, [
+    0xcbbb9d5dc1059ed8, 0x629a292a367cd507, 0x9159015a3070dd17, 0x152fecd8f70e5939,
+    0x67332667ffc00b31, 0x8eb44a8768581511, 0xdb0c2e0d64f98fa7, 0x47b5481dbefa4fa4
+], 48)
+
+// Algorithm 2.B of ISO 32000-2: the hash behind revision 6 encryption. `extra` is
+// the /U string when checking an owner password, and empty otherwise.
+fun pdfHashR6(password: string, salt: string, extra: string): string {
+    var k = sha256(password + salt + extra)
+    var round = 0
+    var going = true
+    while (going) {
+        val block = password + k + extra
+        val repeated = block.repeat(64)
+        val e = pdfAesCbcEncrypt(k.slice(0, 16), k.slice(16, 32), repeated)
+        var remainder = 0
+        for (i in 0 until 16) remainder = remainder + e[i]
+        remainder = remainder % 3
+        k = if (remainder == 0) sha256(e) else if (remainder == 1) pdfSha384(e) else pdfSha512(e)
+        round = round + 1
+        if (round >= 64 && e[e.size - 1] <= round - 32) going = false
+    }
+    k.slice(0, 32)
+}

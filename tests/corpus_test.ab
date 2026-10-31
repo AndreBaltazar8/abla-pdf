@@ -1,0 +1,139 @@
+// Runs the reader over the corpus tools/test-corpus.sh generates and compares it
+// with what poppler and pypdf said about each file. Skipped when not generated.
+
+import "abla/test"
+import "abla/io"
+import "abla/fs"
+import "abla/text"
+import "abla/bytes"
+import "abla/process"
+import "../src/pdf.ab"
+
+// Lowercased words: the comparison is about content, not layout or hyphenation.
+fun wordsOf(text: string): Map<string, int> {
+    val words = Map<string, int>()
+    for (raw in text.replace("\n", " ").replace("\x0c", " ").replace("\r", " ").split(" ")) {
+        val w = raw.trim()
+        if (w.size > 0) words.set(w, (words.get(w) ?? 0) + 1)
+    }
+    words
+}
+
+fun metaValue(meta: string, key: string): string {
+    for (line in meta.split("\n")) {
+        val at = line.indexOf("\t")
+        if (at > 0 && line.slice(0, at) == key) return line.slice(at + 1, line.size)
+    }
+    ""
+}
+
+fun checkFile(stem: string): void {
+    val name = path(stem).name()
+    val data = path("$stem.pdf").readText()
+    val meta = path("$stem.meta").readText()
+    val hostile = name.startsWith("hostile-")
+    val password = metaValue(meta, "Password")
+    val doc = pdfOpen(data, PdfReadOptions(password = password))
+    if (hostile) {
+        // Surviving is the test: read everything there is.
+        if (doc.ok) {
+            for (i in 0 until doc.pageCount()) doc.pageText(i)
+            doc.formFields()
+        }
+        expect(true, "$name survived")
+        return
+    }
+    expect(doc.ok, "$name opens: ${doc.error}")
+    if (!doc.ok) return
+    if (password != "") {
+        val locked = pdfOpen(data)
+        expect(!locked.ok && locked.needsPassword, "$name needs its password")
+        val owner = pdfOpen(data, PdfReadOptions(password = "owner"))
+        expect(owner.ok, "$name opens with the owner password")
+        val wrong = pdfOpen(data, PdfReadOptions(password = "wrong"))
+        expect(!wrong.ok && wrong.needsPassword, "$name rejects a wrong password")
+    }
+    // Where poppler itself gives up, there is nothing to compare with.
+    if (metaValue(meta, "Pages") == "") return
+    expectEqual("${doc.pageCount()}", metaValue(meta, "Pages"), "$name page count")
+    val title = metaValue(meta, "Title")
+    if (title != "") expectEqual(doc.metadata().title, title, "$name title")
+    val author = metaValue(meta, "Author")
+    if (author != "") expectEqual(doc.metadata().author, author, "$name author")
+
+    val mine = byteBuffer()
+    var images = 0
+    var annotations = 0
+    for (i in 0 until doc.pageCount()) {
+        mine.appendText(doc.pageText(i, true))
+        mine.appendText("\n")
+        val placed = doc.pageImages(i)
+        for (image in placed) {
+            images = images + 1
+            val decoded = doc.imageData(image)
+            expect(decoded.ok, "$name image data")
+            if (decoded.encoding == "raw" && image.bitsPerComponent == 8 && image.colorSpace == "DeviceRGB") {
+                expectEqual(decoded.data.size, image.width * image.height * 3, "$name image size")
+            }
+        }
+        // A viewer draws an annotation without an appearance from its contents.
+        for (note in doc.pageAnnotations(i)) {
+            annotations = annotations + 1
+            mine.appendText(note.contents)
+        }
+    }
+    expectEqual("$images", metaValue(meta, "images"), "$name image count")
+    if (metaValue(meta, "annots") != "?") expectEqual("$annotations", metaValue(meta, "annots"), "$name annotation count")
+
+    // Every word poppler found should be among ours, ignoring how text was split.
+    val theirs = wordsOf(path("$stem.txt").readText())
+    val ours = mine.toText().replace(" ", "").replace("\n", "")
+    var missing = 0
+    var total = 0
+    var example = ""
+    for (word in theirs.keys()) {
+        total = total + 1
+        if (!ours.contains(word)) {
+            missing = missing + 1
+            example = word
+        }
+    }
+    expect(missing == 0, "$name text: $missing of $total poppler words missing, such as '$example'")
+
+    val fields = doc.formFields()
+    for (line in path("$stem.fields").readText().split("\n")) {
+        val at = line.indexOf("\t")
+        if (at > 0) {
+            val fieldName = line.slice(0, at)
+            val value = line.slice(at + 1, line.size)
+            var found = false
+            for (f in fields) {
+                if (f.name == fieldName) {
+                    found = true
+                    val shown = if (value.startsWith("/")) value.slice(1, value.size) else value
+                    expectEqual(f.value, shown, "$name field $fieldName")
+                }
+            }
+            expect(found, "$name has field $fieldName")
+        }
+    }
+    return
+}
+
+fun main: int {
+    val dir = path("tests/corpus/generated")
+    if (!dir.exists()) {
+        println("corpus not generated, skipped: run tools/test-corpus.sh")
+        return testsPassed()
+    }
+    var files = 0
+    for (entry in dir.entries()) {
+        if (entry.text.endsWith(".pdf")) {
+            println(entry.name())
+            checkFile(entry.text.slice(0, entry.text.size - 4))
+            files = files + 1
+        }
+    }
+    expect(files >= 30, "corpus has files")
+    testsPassed()
+}

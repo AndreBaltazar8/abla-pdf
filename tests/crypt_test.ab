@@ -1,0 +1,42 @@
+import "abla/test"
+import "abla/crypto"
+import "../src/pdf.ab"
+
+fun main: int {
+    // RFC 6229 test: key "Key", plaintext "Plaintext" (Wikipedia RC4 vectors).
+    expectEqual(hexEncode(pdfRc4("Key", "Plaintext")), "bbf316e8d940af0ad3", "rc4")
+    expectEqual(hexEncode(pdfRc4("Wiki", "pedia")), "1021bf0420", "rc4 2")
+    // FIPS 197 C.1 and C.3.
+    val plain = pdfHexDecode("00112233445566778899aabbccddeeff")
+    val zero = "\0".repeat(16)
+    val k128 = pdfHexDecode("000102030405060708090a0b0c0d0e0f")
+    val k256 = pdfHexDecode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+    expectEqual(hexEncode(pdfAesCbcEncrypt(k128, zero, plain)), "69c4e0d86a7b0430d8cdb78070b4c55a", "aes128 enc")
+    expectEqual(hexEncode(pdfAesCbcEncrypt(k256, zero, plain)), "8ea2b7ca516745bfeafc49904b496089", "aes256 enc")
+    expectEqual(hexEncode(pdfAesCbcDecrypt(k128, zero, pdfHexDecode("69c4e0d86a7b0430d8cdb78070b4c55a"))), hexEncode(plain), "aes128 dec")
+    expectEqual(hexEncode(pdfAesCbcDecrypt(k256, zero, pdfHexDecode("8ea2b7ca516745bfeafc49904b496089"))), hexEncode(plain), "aes256 dec")
+    // NIST CAVP SP 800-38A CBC-AES128, chained blocks.
+    val iv = pdfHexDecode("000102030405060708090a0b0c0d0e0f")
+    val k = pdfHexDecode("2b7e151628aed2a6abf7158809cf4f3c")
+    val two = pdfHexDecode("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51")
+    val enc = pdfAesCbcEncrypt(k, iv, two)
+    expectEqual(hexEncode(enc), "7649abac8119b246cee98e9b12e9197d5086cb9b507219ee95db113a917678b2", "cbc enc")
+    expectEqual(hexEncode(pdfAesCbcDecrypt(k, iv, enc)), hexEncode(two), "cbc dec")
+    // FIPS 180-4 examples.
+    expectEqual(hexEncode(pdfSha512("abc")), "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f", "sha512")
+    expectEqual(hexEncode(pdfSha384("abc")), "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7", "sha384")
+    expectEqual(hexEncode(pdfSha512("")).slice(0, 16), "cf83e1357eefb8bd", "sha512 empty")
+    // Filters.
+    expectEqual(pdfDecodeAsciiHex("48 65 6c6C 6f>", 100).data, "Hello", "hex")
+    expectEqual(pdfDecodeAscii85("87cURD]i,\"Ebo80~>", 100).data, "Hello World!", "a85")
+    expectEqual(pdfDecodeAscii85("z~>", 100).data, "\0\0\0\0", "a85 z")
+    expectEqual(pdfDecodeRunLength(pdfHexDecode("0261626383" + "63" + "80"), 1000).data, "abc" + "c".repeat(126), "rl")
+    // From the PDF specification: 45 45 45 45 45 65 45 45 45 66.
+    expectEqual(hexEncode(pdfDecodeLzw(pdfHexDecode("800B6050220C0C8501"), true, 100).data), "2d2d2d2d2d412d2d2d42", "lzw")
+    expect(!pdfDecodeLzw(pdfHexDecode("FFFFFFFF"), true, 100).ok, "bad lzw")
+    val png = pdfHexDecode("0201020304" + "0201010101" + "010a0a0a0a")
+    expectEqual(hexEncode(pdfUndoPredictor(png, 12, 1, 8, 4).data), "01020304" + "02030405" + "0a141e28", "png predictor")
+    expectEqual(hexEncode(pdfUndoPredictor(pdfHexDecode("0a01010a0101"), 2, 1, 8, 3).data), "0a0b0c0a0b0c", "tiff predictor")
+    expect(!pdfUndoPredictor("x", 12, 0, 8, 4).ok, "bad predictor args")
+    testsPassed()
+}

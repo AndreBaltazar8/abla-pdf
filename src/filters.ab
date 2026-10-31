@@ -1,0 +1,214 @@
+// The non-Flate stream filters and the predictors. All take a limit on the bytes
+// they produce and stop there; malformed input ends the output early.
+
+import "abla/bytes"
+
+class PdfFilterResult(val data: string, val ok: bool, val error: string)
+
+fun pdfDecodeAsciiHex(source: string, maxOutput: int): PdfFilterResult {
+    val out = byteBuffer()
+    var high = -1
+    var count = 0
+    for (c in source) {
+        if (c == 62) break
+        val digit = pdfHexDigit(c)
+        if (digit >= 0) {
+            if (high < 0) high = digit
+            else {
+                if (count >= maxOutput) return PdfFilterResult(out.toText(), false, "ASCIIHex output exceeds the limit")
+                out.appendByteValue(high * 16 + digit)
+                count = count + 1
+                high = -1
+            }
+        }
+    }
+    if (high >= 0) out.appendByteValue(high * 16)
+    PdfFilterResult(out.toText(), true, "")
+}
+
+fun pdfDecodeAscii85(source: string, maxOutput: int): PdfFilterResult {
+    val out = byteBuffer()
+    var value = 0
+    var digits = 0
+    var count = 0
+    for (c in source) {
+        if (c == 126) break
+        if (c == 122 && digits == 0) {
+            if (count + 4 > maxOutput) return PdfFilterResult(out.toText(), false, "ASCII85 output exceeds the limit")
+            out.appendText("\0\0\0\0")
+            count = count + 4
+        } else if (c >= 33 && c <= 117) {
+            value = value * 85 + (c - 33)
+            digits = digits + 1
+            if (digits == 5) {
+                if (count + 4 > maxOutput) return PdfFilterResult(out.toText(), false, "ASCII85 output exceeds the limit")
+                out.pdfAppendU32(value & 0xffffffff)
+                count = count + 4
+                value = 0
+                digits = 0
+            }
+        }
+    }
+    if (digits > 1) {
+        for (i in digits until 5) value = value * 85 + 84
+        for (i in 0 until digits - 1) out.appendByteValue((value >> (24 - 8 * i)) & 255)
+    }
+    PdfFilterResult(out.toText(), true, "")
+}
+
+fun pdfDecodeRunLength(source: string, maxOutput: int): PdfFilterResult {
+    val out = byteBuffer()
+    var count = 0
+    var i = 0
+    while (i < source.size) {
+        val length = source[i]
+        i = i + 1
+        if (length == 128) break
+        if (length < 128) {
+            val n = length + 1
+            val stop = if (i + n > source.size) source.size else i + n
+            if (count + stop - i > maxOutput) return PdfFilterResult(out.toText(), false, "RunLength output exceeds the limit")
+            out.appendText(source.slice(i, stop))
+            count = count + stop - i
+            i = stop
+        } else {
+            if (i >= source.size) break
+            val n = 257 - length
+            if (count + n > maxOutput) return PdfFilterResult(out.toText(), false, "RunLength output exceeds the limit")
+            for (k in 0 until n) out.appendByteValue(source[i])
+            count = count + n
+            i = i + 1
+        }
+    }
+    PdfFilterResult(out.toText(), true, "")
+}
+
+fun pdfDecodeLzw(source: string, earlyChange: bool, maxOutput: int): PdfFilterResult {
+    val out = byteBuffer()
+    val prefix = filledArray(4097, -1)
+    val suffix = filledArray(4097, 0)
+    val length = filledArray(4097, 1)
+    for (i in 0 until 256) suffix[i] = i
+    val stack = filledArray(4098, 0)
+    val early = if (earlyChange) 1 else 0
+    var next = 258
+    var width = 9
+    var previous = -1
+    var bits = 0
+    var bitCount = 0
+    var count = 0
+    var pos = 0
+    while (true) {
+        while (bitCount < width && pos < source.size) {
+            bits = (bits << 8) | source[pos]
+            pos = pos + 1
+            bitCount = bitCount + 8
+        }
+        if (bitCount < width) break
+        val code = (bits >> (bitCount - width)) & ((1 << width) - 1)
+        bitCount = bitCount - width
+        bits = bits & ((1 << bitCount) - 1)
+        if (code == 257) break
+        if (code == 256) {
+            next = 258
+            width = 9
+            previous = -1
+            continue
+        }
+        if (code > next || (code == next && previous < 0)) {
+            return PdfFilterResult(out.toText(), false, "invalid LZW code")
+        }
+        val walk = if (code < next) code else previous
+        val size = length[walk] + (if (code < next) 0 else 1)
+        if (count + size > maxOutput) return PdfFilterResult(out.toText(), false, "LZW output exceeds the limit")
+        var depth = 0
+        var cursor = walk
+        while (cursor >= 0) {
+            stack[depth] = suffix[cursor]
+            depth = depth + 1
+            cursor = prefix[cursor]
+        }
+        val firstByte = stack[depth - 1]
+        var k = depth - 1
+        while (k >= 0) {
+            out.appendByteValue(stack[k])
+            k = k - 1
+        }
+        if (code == next) out.appendByteValue(firstByte)
+        count = count + size
+        if (previous >= 0 && next < 4096) {
+            prefix[next] = previous
+            suffix[next] = firstByte
+            length[next] = length[previous] + 1
+            next = next + 1
+        }
+        if (next + early >= 2048) width = 12
+        else if (next + early >= 1024) width = 11
+        else if (next + early >= 512) width = 10
+        else width = 9
+        previous = code
+    }
+    PdfFilterResult(out.toText(), true, "")
+}
+
+private fun paeth(a: int, b: int, c: int): int {
+    val p = a + b - c
+    val pa = if (p > a) p - a else a - p
+    val pb = if (p > b) p - b else b - p
+    val pc = if (p > c) p - c else c - p
+    if (pa <= pb && pa <= pc) a else if (pb <= pc) b else c
+}
+
+// Undoes the PNG (10 and up) or TIFF (2) predictor of a Flate or LZW stream.
+fun pdfUndoPredictor(data: string, predictor: int, colors: int, bits: int, columns: int): PdfFilterResult {
+    if (predictor <= 1) return PdfFilterResult(data, true, "")
+    if (colors < 1 || colors > 64 || bits < 1 || bits > 16 || columns < 1 || columns > 1000000) {
+        return PdfFilterResult(data, false, "invalid predictor parameters")
+    }
+    val rowBytes = (columns * colors * bits + 7) / 8
+    val pixelBytes = if (colors * bits < 8) 1 else colors * bits / 8
+    val out = byteBuffer()
+    if (predictor == 2) {
+        if (bits != 8 && bits != 16) return PdfFilterResult(data, true, "")
+        var at = 0
+        val line = filledArray(rowBytes, 0)
+        while (at < data.size) {
+            val stop = if (at + rowBytes < data.size) at + rowBytes else data.size
+            for (i in 0 until stop - at) {
+                val raw = data[at + i]
+                line[i] = if (i >= pixelBytes) (raw + line[i - pixelBytes]) & 255 else raw
+                out.appendByteValue(line[i])
+            }
+            at = stop
+        }
+        return PdfFilterResult(out.toText(), true, "")
+    }
+    val previous = filledArray(rowBytes, 0)
+    val current = filledArray(rowBytes, 0)
+    var at = 0
+    while (at + 1 < data.size) {
+        val filter = data[at]
+        at = at + 1
+        val stop = if (at + rowBytes < data.size) at + rowBytes else data.size
+        val count = stop - at
+        for (i in 0 until count) {
+            val x = data[at + i]
+            val a = if (i >= pixelBytes) current[i - pixelBytes] else 0
+            val b = previous[i]
+            val c = if (i >= pixelBytes) previous[i - pixelBytes] else 0
+            val v = when (filter) {
+                0 -> x
+                1 -> x + a
+                2 -> x + b
+                3 -> x + (a + b) / 2
+                4 -> x + paeth(a, b, c)
+                else -> x
+            } & 255
+            current[i] = v
+            out.appendByteValue(v)
+        }
+        at = stop
+        for (i in 0 until count) previous[i] = current[i]
+    }
+    PdfFilterResult(out.toText(), true, "")
+}

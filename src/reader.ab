@@ -1,0 +1,1456 @@
+// Reading the structure of a PDF file: syntax, cross-references, object streams,
+// incremental updates, filters and encryption.
+//
+// Parsed objects live in an arena inside PdfReader and are named by integers, so
+// any object can be held while the reader goes on parsing. Every limit is checked
+// where the work happens: the input can't cause a panic or an unbounded loop,
+// and past a limit a read just ends with less data and a note in `warnings`.
+
+import "abla/bytes"
+import "abla/crypto"
+import "abla/float"
+import "abla/text"
+
+val PDF_NULL = 0
+val PDF_BOOL = 1
+val PDF_INT = 2
+val PDF_REAL = 3
+val PDF_STRING = 4
+val PDF_NAME = 5
+val PDF_ARRAY = 6
+val PDF_DICT = 7
+val PDF_REF = 8
+val PDF_STREAM = 9
+val PDF_KEYWORD = 10
+val PDF_END = 11
+
+class PdfReadOptions(
+    val password: string = "",
+    // The most bytes one decoded stream may produce.
+    val maxStreamBytes: int = 67108864,
+    // The most bytes all decoding of this document may produce.
+    val maxTotalBytes: int = 1073741824,
+    // The most parsed values held at once.
+    val maxNodes: int = 8000000,
+    val maxDepth: int = 48,
+    val maxPages: int = 200000,
+    // The most content stream operators one page may run, forms included.
+    val maxOperators: int = 20000000
+)
+
+class PdfLexer(val source: string, var pos: int)
+
+private fun isSpace(c: int): bool = c == 32 || c == 10 || c == 13 || c == 9 || c == 12 || c == 0
+
+private fun isDelimiter(c: int): bool =
+    c == 40 || c == 41 || c == 60 || c == 62 || c == 91 || c == 93 || c == 123 || c == 125 || c == 47 || c == 37
+
+private fun isRegular(c: int): bool = !isSpace(c) && !isDelimiter(c)
+
+private fun isDigit(c: int): bool = c >= 48 && c <= 57
+
+private fun skipSpace(var lx: PdfLexer): void {
+    val s = lx.source
+    val n = s.size
+    var p = lx.pos
+    while (p < n) {
+        val c = s[p]
+        if (isSpace(c)) p = p + 1
+        else if (c == 37) {
+            while (p < n && s[p] != 10 && s[p] != 13) p = p + 1
+        } else break
+    }
+    lx.pos = p
+    return
+}
+
+// One page's place in the document, with what it inherits already resolved.
+class PdfPageEntry(
+    val dict: int,
+    val resources: int,
+    val mediaBox: int,
+    val cropBox: int,
+    val rotate: int
+)
+
+class PdfReader(
+    val data: string,
+    val options: PdfReadOptions,
+    val kinds: array<int> = array<int>(),
+    val first: array<int> = array<int>(),
+    val second: array<int> = array<int>(),
+    val reals: array<f64> = array<f64>(),
+    val texts: array<string> = array<string>(),
+    val children: array<int> = array<int>(),
+    val streamBegin: array<int> = array<int>(),
+    val streamEnd: array<int> = array<int>(),
+    val streamNumber: array<int> = array<int>(),
+    val streamGeneration: array<int> = array<int>(),
+    val xrefOffset: Map<int, int> = Map<int, int>(),
+    val xrefGeneration: Map<int, int> = Map<int, int>(),
+    val xrefStream: Map<int, int> = Map<int, int>(),
+    val xrefIndex: Map<int, int> = Map<int, int>(),
+    val xrefFree: Map<int, int> = Map<int, int>(),
+    val objectCache: Map<int, int> = Map<int, int>(),
+    val objectBusy: Map<int, int> = Map<int, int>(),
+    val objectStreamData: Map<int, string> = Map<int, string>(),
+    val objectStreamFirst: Map<int, int> = Map<int, int>(),
+    val objectStreamOffsets: Map<int, array<int>> = Map<int, array<int>>(),
+    val warnings: array<string> = array<string>(),
+    val pages: array<PdfPageEntry> = array<PdfPageEntry>(),
+    val fontCache: array<PdfFontDecoder> = array<PdfFontDecoder>(),
+    val fontIndex: Map<int, int> = Map<int, int>(),
+    var ok: bool = false,
+    var error: string = "",
+    var version: string = "",
+    var trailer: int = 0,
+    var root: int = 0,
+    var repaired: bool = false,
+    var decodedTotal: int = 0,
+    var arenaGrew: bool = false,
+    var limitHit: bool = false,
+    var loadDepth: int = 0,
+    var scanned: int = 0,
+    var xrefEntries: int = 0,
+    // Encryption state.
+    var encrypted: bool = false,
+    var needsPassword: bool = false,
+    var encryptNumber: int = -1,
+    var fileKey: string = "",
+    var stringMethod: int = 0,
+    var streamMethod: int = 0,
+    var encryptMetadata: bool = true,
+    var cryptRevision: int = 0,
+    var currentNumber: int = -1,
+    var currentGeneration: int = 0
+) {
+    fun warn(message: string): void {
+        if (warnings.size < 64) warnings.append(message)
+    }
+
+    fun node(kind: int, a: int, b: int): int {
+        if (kinds.size >= options.maxNodes) {
+            if (!limitHit) warn("too many parsed values; the document is only partly read")
+            limitHit = true
+            return 0
+        }
+        kinds.append(kind)
+        first.append(a)
+        second.append(b)
+        kinds.size - 1
+    }
+
+    fun textNode(kind: int, text: string): int {
+        val id = node(kind, texts.size, 0)
+        if (id != 0) texts.append(text)
+        id
+    }
+
+    fun realNode(value: f64): int {
+        val id = node(PDF_REAL, reals.size, 0)
+        if (id != 0) reals.append(value)
+        id
+    }
+
+    fun kindOf(id: int): int = kinds[id]
+
+    // The arena shrinks back to a mark once nothing refers past it.
+    fun release(nodes: int, realCount: int, textCount: int, childCount: int): void {
+        kinds.truncate(nodes)
+        first.truncate(nodes)
+        second.truncate(nodes)
+        reals.truncate(realCount)
+        texts.truncate(textCount)
+        children.truncate(childCount)
+    }
+
+    // --- Syntax ------------------------------------------------------------
+
+    fun parseNumber(var lx: PdfLexer): int {
+        val s = lx.source
+        val n = s.size
+        var p = lx.pos
+        var negative = false
+        while (p < n && (s[p] == 43 || s[p] == 45)) {
+            if (s[p] == 45) negative = true
+            p = p + 1
+        }
+        var whole = 0
+        var big = 0.0
+        var digits = 0
+        while (p < n && isDigit(s[p])) {
+            if (digits < 18) whole = whole * 10 + (s[p] - 48)
+            big = big * 10.0 + f64FromInt(s[p] - 48)
+            digits = digits + 1
+            p = p + 1
+        }
+        var isReal = false
+        var fraction = 0.0
+        if (p < n && s[p] == 46) {
+            isReal = true
+            p = p + 1
+            var scale = 0.1
+            while (p < n && (isDigit(s[p]) || s[p] == 45)) {
+                if (s[p] != 45 && scale > 1e-15) {
+                    fraction = fraction + f64FromInt(s[p] - 48) * scale
+                    scale = scale * 0.1
+                }
+                p = p + 1
+            }
+        }
+        if (p == lx.pos) p = p + 1
+        lx.pos = p
+        if (isReal || digits >= 18) {
+            val value = (if (digits >= 18) big else f64FromInt(whole)) + fraction
+            return realNode(if (negative) 0.0 - value else value)
+        }
+        node(PDF_INT, if (negative) 0 - whole else whole, 0)
+    }
+
+    fun parseName(var lx: PdfLexer): int {
+        val s = lx.source
+        val n = s.size
+        var p = lx.pos + 1
+        val begin = p
+        var escaped = false
+        while (p < n && isRegular(s[p])) {
+            if (s[p] == 35) escaped = true
+            p = p + 1
+        }
+        lx.pos = p
+        if (!escaped) return textNode(PDF_NAME, s.slice(begin, p))
+        val out = byteBuffer()
+        var i = begin
+        while (i < p) {
+            if (s[i] == 35 && i + 2 < p && pdfHexDigit(s[i + 1]) >= 0 && pdfHexDigit(s[i + 2]) >= 0) {
+                out.appendByteValue(pdfHexDigit(s[i + 1]) * 16 + pdfHexDigit(s[i + 2]))
+                i = i + 3
+            } else {
+                out.appendByteValue(s[i])
+                i = i + 1
+            }
+        }
+        textNode(PDF_NAME, out.toText())
+    }
+
+    fun parseLiteral(var lx: PdfLexer): int {
+        val s = lx.source
+        val n = s.size
+        var p = lx.pos + 1
+        var depth = 1
+        val out = byteBuffer()
+        while (p < n && depth > 0) {
+            val c = s[p]
+            p = p + 1
+            if (c == 40) {
+                depth = depth + 1
+                out.appendByteValue(c)
+            } else if (c == 41) {
+                depth = depth - 1
+                if (depth > 0) out.appendByteValue(c)
+            } else if (c == 92 && p < n) {
+                val e = s[p]
+                p = p + 1
+                if (e == 110) out.appendByteValue(10)
+                else if (e == 114) out.appendByteValue(13)
+                else if (e == 116) out.appendByteValue(9)
+                else if (e == 98) out.appendByteValue(8)
+                else if (e == 102) out.appendByteValue(12)
+                else if (e == 13) {
+                    if (p < n && s[p] == 10) p = p + 1
+                } else if (e == 10) {
+                } else if (e >= 48 && e <= 55) {
+                    var v = e - 48
+                    var count = 1
+                    while (count < 3 && p < n && s[p] >= 48 && s[p] <= 55) {
+                        v = v * 8 + (s[p] - 48)
+                        p = p + 1
+                        count = count + 1
+                    }
+                    out.appendByteValue(v & 255)
+                } else out.appendByteValue(e)
+            } else if (c == 13) {
+                if (p < n && s[p] == 10) p = p + 1
+                out.appendByteValue(10)
+            } else out.appendByteValue(c)
+        }
+        lx.pos = p
+        textNode(PDF_STRING, decryptString(out.toText()))
+    }
+
+    fun parseHex(var lx: PdfLexer): int {
+        val s = lx.source
+        var p = lx.pos + 1
+        val begin = p
+        while (p < s.size && s[p] != 62) p = p + 1
+        val body = s.slice(begin, p)
+        lx.pos = if (p < s.size) p + 1 else p
+        textNode(PDF_STRING, decryptString(pdfHexDecode(body)))
+    }
+
+    // Reads one value. In a file `refs` turns "1 0 R" into a reference; a word
+    // that isn't a value comes back as a PDF_KEYWORD, the end as PDF_END.
+    fun parseValue(var lx: PdfLexer, refs: bool, depth: int): int {
+        skipSpace(lx)
+        val s = lx.source
+        val n = s.size
+        if (lx.pos >= n) return node(PDF_END, 0, 0)
+        val c = s[lx.pos]
+        if (c == 47) return parseName(lx)
+        if (c == 40) return parseLiteral(lx)
+        if (c == 60) {
+            if (lx.pos + 1 < n && s[lx.pos + 1] == 60) return parseDict(lx, refs, depth)
+            return parseHex(lx)
+        }
+        if (c == 91) return parseArray(lx, refs, depth)
+        if (isDigit(c) || c == 43 || c == 45 || c == 46) {
+            val id = parseNumber(lx)
+            if (refs && kinds[id] == PDF_INT && first[id] >= 0 && lx.pos < n && isSpace(s[lx.pos])) {
+                // Look ahead for "generation R".
+                val mark = lx.pos
+                var p = mark
+                while (p < n && isSpace(s[p])) p = p + 1
+                var gen = 0
+                val genBegin = p
+                while (p < n && isDigit(s[p]) && p - genBegin < 6) {
+                    gen = gen * 10 + (s[p] - 48)
+                    p = p + 1
+                }
+                if (p > genBegin && p < n && isSpace(s[p])) {
+                    while (p < n && isSpace(s[p])) p = p + 1
+                    if (p < n && s[p] == 82 && (p + 1 >= n || !isRegular(s[p + 1]))) {
+                        lx.pos = p + 1
+                        return node(PDF_REF, first[id], gen)
+                    }
+                }
+            }
+            return id
+        }
+        if (c == 93 || c == 41 || c == 125 || c == 123) {
+            lx.pos = lx.pos + 1
+            return textNode(PDF_KEYWORD, s.slice(lx.pos - 1, lx.pos))
+        }
+        if (c == 62) {
+            lx.pos = lx.pos + (if (lx.pos + 1 < n && s[lx.pos + 1] == 62) 2 else 1)
+            return textNode(PDF_KEYWORD, ">>")
+        }
+        var p = lx.pos
+        while (p < n && isRegular(s[p])) p = p + 1
+        val word = s.slice(lx.pos, p)
+        lx.pos = p
+        when (word) {
+            "true" -> node(PDF_BOOL, 1, 0)
+            "false" -> node(PDF_BOOL, 0, 0)
+            "null" -> 0
+            else -> textNode(PDF_KEYWORD, word)
+        }
+    }
+
+    fun parseArray(var lx: PdfLexer, refs: bool, depth: int): int {
+        lx.pos = lx.pos + 1
+        if (depth >= options.maxDepth) {
+            warn("nesting too deep")
+            lx.pos = lx.source.size
+            return 0
+        }
+        val items: array<int> = []
+        while (true) {
+            skipSpace(lx)
+            if (lx.pos >= lx.source.size) break
+            if (lx.source[lx.pos] == 93) {
+                lx.pos = lx.pos + 1
+                break
+            }
+            val item = parseValue(lx, refs, depth + 1)
+            val kind = kinds[item]
+            if (kind == PDF_END) break
+            if (kind == PDF_KEYWORD) {
+                val word = texts[first[item]]
+                // A file's array can't hold these: it ended without its bracket.
+                if (word == "endobj" || word == "endstream" || word == "obj" || word == ">>") break
+            } else items.append(item)
+            if (limitHit) break
+        }
+        val begin = children.size
+        for (item in items) children.append(item)
+        node(PDF_ARRAY, begin, items.size)
+    }
+
+    fun parseDict(var lx: PdfLexer, refs: bool, depth: int): int {
+        lx.pos = lx.pos + 2
+        if (depth >= options.maxDepth) {
+            warn("nesting too deep")
+            lx.pos = lx.source.size
+            return 0
+        }
+        val items: array<int> = []
+        val s = lx.source
+        while (true) {
+            skipSpace(lx)
+            if (lx.pos >= s.size) break
+            val c = s[lx.pos]
+            if (c == 62) {
+                lx.pos = lx.pos + (if (lx.pos + 1 < s.size && s[lx.pos + 1] == 62) 2 else 1)
+                break
+            }
+            if (c != 47) {
+                // Not a key: skip the value, unless the dictionary has run out.
+                val junk = parseValue(lx, refs, depth + 1)
+                if (kinds[junk] == PDF_END) break
+                if (kinds[junk] == PDF_KEYWORD) {
+                    val word = texts[first[junk]]
+                    if (word == "endobj" || word == "stream" || word == "endstream") {
+                        lx.pos = lx.pos - word.size
+                        break
+                    }
+                }
+                continue
+            }
+            val key = parseName(lx)
+            skipSpace(lx)
+            if (lx.pos < s.size && s[lx.pos] == 62) {
+                continue
+            }
+            val value = parseValue(lx, refs, depth + 1)
+            val kind = kinds[value]
+            if (kind == PDF_END) break
+            if (kind == PDF_KEYWORD) {
+                val word = texts[first[value]]
+                if (word == "endobj" || word == "stream" || word == "endstream") {
+                    lx.pos = lx.pos - word.size
+                    break
+                }
+            } else {
+                items.append(key)
+                items.append(value)
+            }
+            if (limitHit) break
+        }
+        val begin = children.size
+        for (item in items) children.append(item)
+        node(PDF_DICT, begin, items.size / 2)
+    }
+
+    // --- Access ------------------------------------------------------------
+
+    fun isName(id: int, name: string): bool {
+        val v = resolve(id)
+        kinds[v] == PDF_NAME && texts[first[v]] == name
+    }
+
+    fun nameOf(id: int): string {
+        val v = resolve(id)
+        if (kinds[v] == PDF_NAME) texts[first[v]] else ""
+    }
+
+    fun stringOf(id: int): string {
+        val v = resolve(id)
+        if (kinds[v] == PDF_STRING) texts[first[v]] else ""
+    }
+
+    fun intOf(id: int, fallback: int = 0): int {
+        val v = resolve(id)
+        val k = kinds[v]
+        if (k == PDF_INT) return first[v]
+        if (k == PDF_REAL) return f64ToInt(reals[first[v]])
+        fallback
+    }
+
+    fun numberOf(id: int, fallback: f64 = 0.0): f64 {
+        val v = resolve(id)
+        val k = kinds[v]
+        if (k == PDF_INT) return f64FromInt(first[v])
+        if (k == PDF_REAL) return reals[first[v]]
+        fallback
+    }
+
+    fun boolOf(id: int, fallback: bool = false): bool {
+        val v = resolve(id)
+        if (kinds[v] == PDF_BOOL) first[v] != 0 else fallback
+    }
+
+    fun isNumber(id: int): bool {
+        val k = kinds[resolve(id)]
+        k == PDF_INT || k == PDF_REAL
+    }
+
+    fun dictOf(id: int): int {
+        val v = resolve(id)
+        val k = kinds[v]
+        if (k == PDF_DICT) return v
+        if (k == PDF_STREAM) return first[v]
+        0
+    }
+
+    // The value of `key` in a dictionary or stream, unresolved; 0 when absent.
+    fun get(id: int, key: string): int {
+        val d = dictOf(id)
+        if (d == 0) return 0
+        val begin = first[d]
+        val count = second[d]
+        for (i in 0 until count) {
+            val k = children[begin + i * 2]
+            if (texts[first[k]] == key) return children[begin + i * 2 + 1]
+        }
+        0
+    }
+
+    fun getResolved(id: int, key: string): int = resolve(get(id, key))
+
+    fun hasKey(id: int, key: string): bool = get(id, key) != 0
+
+    fun arraySize(id: int): int {
+        val v = resolve(id)
+        if (kinds[v] == PDF_ARRAY) second[v] else 0
+    }
+
+    fun arrayAt(id: int, index: int): int {
+        val v = resolve(id)
+        if (kinds[v] != PDF_ARRAY || index < 0 || index >= second[v]) return 0
+        children[first[v] + index]
+    }
+
+    fun dictSize(id: int): int {
+        val d = dictOf(id)
+        if (d == 0) 0 else second[d]
+    }
+
+    fun dictKeyAt(id: int, index: int): string {
+        val d = dictOf(id)
+        if (d == 0 || index >= second[d]) return ""
+        texts[first[children[first[d] + index * 2]]]
+    }
+
+    fun dictValueAt(id: int, index: int): int {
+        val d = dictOf(id)
+        if (d == 0 || index >= second[d]) return 0
+        children[first[d] + index * 2 + 1]
+    }
+
+    // Follows references to the value they name, null for a dangling one.
+    fun resolve(id: int): int {
+        var current = id
+        var hops = 0
+        while (kinds[current] == PDF_REF) {
+            hops = hops + 1
+            if (hops > 32) return 0
+            current = loadObject(first[current])
+        }
+        current
+    }
+
+    // --- Objects -----------------------------------------------------------
+
+    fun loadObject(number: int): int {
+        val cached = objectCache.get(number)
+        if (cached != null) return cached
+        if (objectBusy.has(number)) return 0
+        if (limitHit) return 0
+        // Chains such as one stream's /Length naming the next stream end here,
+        // whatever the file does, well before the stack would.
+        if (loadDepth >= 32) return 0
+        objectBusy.set(number, 1)
+        loadDepth = loadDepth + 1
+        var id = 0
+        val packedStream = xrefStream.get(number)
+        val offset = xrefOffset.get(number)
+        if (packedStream != null) {
+            id = loadFromObjectStream(number, packedStream, xrefIndex.get(number) ?? 0)
+        } else if (offset != null) {
+            id = parseIndirectAt(offset, number)
+            if (id < 0) {
+                id = 0
+                if (!repaired) {
+                    repair()
+                    objectBusy.remove(number)
+                    loadDepth = loadDepth - 1
+                    return loadObject(number)
+                }
+            }
+        }
+        loadDepth = loadDepth - 1
+        objectBusy.remove(number)
+        objectCache.set(number, id)
+        arenaGrew = true
+        id
+    }
+
+    // The object at `offset`, or -1 if what's there isn't object `expected`
+    // (any object when `expected` is negative). Scanning uses that to index them.
+    fun parseIndirectAt(offset: int, expected: int): int {
+        if (offset < 0 || offset >= data.size) return -1
+        val lx = PdfLexer(data, offset)
+        skipSpace(lx)
+        var p = lx.pos
+        var number = 0
+        val numberBegin = p
+        while (p < data.size && isDigit(data[p]) && p - numberBegin < 12) {
+            number = number * 10 + (data[p] - 48)
+            p = p + 1
+        }
+        if (p == numberBegin) return -1
+        while (p < data.size && isSpace(data[p])) p = p + 1
+        var generation = 0
+        val genBegin = p
+        while (p < data.size && isDigit(data[p]) && p - genBegin < 6) {
+            generation = generation * 10 + (data[p] - 48)
+            p = p + 1
+        }
+        if (p == genBegin) return -1
+        while (p < data.size && isSpace(data[p])) p = p + 1
+        if (!pdfStartsWithAt(data, p, "obj")) return -1
+        if (expected >= 0 && number != expected) return -1
+        lx.pos = p + 3
+        val savedNumber = currentNumber
+        val savedGeneration = currentGeneration
+        currentNumber = number
+        currentGeneration = generation
+        val value = parseValue(lx, true, 0)
+        var result = value
+        if (kinds[value] == PDF_END || kinds[value] == PDF_KEYWORD) result = 0
+        else if (kinds[value] == PDF_DICT) {
+            skipSpace(lx)
+            if (pdfStartsWithAt(data, lx.pos, "stream")) result = makeStream(value, lx.pos + 6, number, generation)
+        }
+        currentNumber = savedNumber
+        currentGeneration = savedGeneration
+        result
+    }
+
+    fun makeStream(dict: int, afterKeyword: int, number: int, generation: int): int {
+        var begin = afterKeyword
+        val n = data.size
+        if (begin < n && data[begin] == 13) {
+            begin = begin + 1
+            if (begin < n && data[begin] == 10) begin = begin + 1
+        } else if (begin < n && data[begin] == 10) begin = begin + 1
+        else {
+            // Spaces before the end of line happen in the wild.
+            var p = begin
+            while (p < n && (data[p] == 32 || data[p] == 9)) p = p + 1
+            if (p < n && data[p] == 13) p = p + 1
+            if (p < n && data[p] == 10) begin = p + 1
+        }
+        val lengthId = get(dict, "Length")
+        val length = if (lengthId == 0) -1 else intOf(lengthId, -1)
+        var end = -1
+        if (length >= 0 && begin + length <= n) {
+            var p = begin + length
+            while (p < n && p < begin + length + 3 && isSpace(data[p])) p = p + 1
+            if (pdfStartsWithAt(data, p, "endstream") || pdfStartsWithAt(data, p, "endobj")) end = begin + length
+        }
+        if (end < 0) {
+            // A wrong /Length: find the end by its keyword.
+            // The searches are capped overall, so many such streams stay linear.
+            var stop = begin
+            if (scanned <= 8 * n + 16777216) {
+                stop = data.indexOf("endstream", begin)
+                if (stop < 0) stop = data.indexOf("endobj", begin)
+                if (stop < 0) stop = n
+                scanned = scanned + stop - begin
+            }
+            end = stop
+            if (end > begin && data[end - 1] == 10) end = end - 1
+            if (end > begin && data[end - 1] == 13) end = end - 1
+        }
+        val index = streamBegin.size
+        streamBegin.append(begin)
+        streamEnd.append(end)
+        streamNumber.append(number)
+        streamGeneration.append(generation)
+        node(PDF_STREAM, dict, index)
+    }
+
+    fun loadFromObjectStream(number: int, stream: int, index: int): int {
+        if (!prepareObjectStream(stream)) return 0
+        val content = objectStreamData.get(stream) ?? ""
+        val offsets = objectStreamOffsets.get(stream)
+        if (offsets == null) return 0
+        var slot = index * 2
+        // The cross-reference index may be wrong; the header isn't.
+        if (slot < 0 || slot + 1 >= offsets.size || offsets[slot] != number) {
+            slot = -1
+            var i = 0
+            while (i + 1 < offsets.size) {
+                if (offsets[i] == number) slot = i
+                i = i + 2
+            }
+            if (slot < 0) return 0
+        }
+        val base = objectStreamFirst.get(stream) ?? 0
+        if (offsets[slot + 1] < 0) return 0
+        val lx = PdfLexer(content, base + offsets[slot + 1])
+        // Objects in a stream were encrypted with the stream, not by themselves.
+        val saved = currentNumber
+        currentNumber = -2
+        val id = parseValue(lx, true, 0)
+        currentNumber = saved
+        if (kinds[id] == PDF_END || kinds[id] == PDF_KEYWORD) 0 else id
+    }
+
+    fun prepareObjectStream(stream: int): bool {
+        if (objectStreamData.has(stream)) return true
+        objectStreamData.set(stream, "")
+        val id = loadObject(stream)
+        if (kinds[id] != PDF_STREAM) return false
+        val content = decodeStream(id)
+        val count = intOf(get(id, "N"), 0)
+        val firstAt = intOf(get(id, "First"), 0)
+        if (count < 0 || firstAt < 0 || firstAt > content.size) return false
+        val lx = PdfLexer(content, 0)
+        val offsets: array<int> = []
+        var i = 0
+        while (i < count * 2 && lx.pos < firstAt) {
+            val mark = kinds.size
+            val v = parseValue(lx, false, 0)
+            if (kinds[v] != PDF_INT) break
+            offsets.append(first[v])
+            release(mark, reals.size, texts.size, children.size)
+            i = i + 1
+        }
+        objectStreamData.set(stream, content)
+        objectStreamFirst.set(stream, firstAt)
+        objectStreamOffsets.set(stream, offsets)
+        true
+    }
+
+    // --- Cross-references --------------------------------------------------
+
+    fun open(): void {
+        // Node 0 is the null every failed read gives.
+        kinds.append(PDF_NULL)
+        first.append(0)
+        second.append(0)
+        val headerAt = data.slice(0, if (data.size < 1024) data.size else 1024).indexOf("%PDF-")
+        if (headerAt < 0) warn("no PDF header")
+        else {
+            var p = headerAt + 5
+            while (p < data.size && p < headerAt + 12 && (isDigit(data[p]) || data[p] == 46)) p = p + 1
+            version = data.slice(headerAt + 5, p)
+        }
+        var good = readCrossReferences(if (headerAt > 0) headerAt else 0)
+        if (good && !setupEncryption()) good = needsPassword
+        if (needsPassword) {
+            error = "the document needs a password"
+            encrypted = true
+            return
+        }
+        if (good) good = buildPages()
+        if (!good && !repaired) {
+            repair()
+            if (setupEncryption() || !encrypted) buildPages()
+            if (needsPassword) {
+                error = "the document needs a password"
+                return
+            }
+        }
+        if (pages.size == 0) {
+            if (error == "") error = "no pages found"
+            return
+        }
+        ok = true
+    }
+
+    fun findStartXref(): int {
+        val tailBegin = if (data.size > 2048) data.size - 2048 else 0
+        val at = data.slice(tailBegin, data.size).lastIndexOf("startxref")
+        if (at < 0) return -1
+        var p = tailBegin + at + 9
+        while (p < data.size && isSpace(data[p])) p = p + 1
+        var value = 0
+        val begin = p
+        while (p < data.size && isDigit(data[p]) && p - begin < 15) {
+            value = value * 10 + (data[p] - 48)
+            p = p + 1
+        }
+        if (p == begin) -1 else value
+    }
+
+    fun readCrossReferences(headerAt: int): bool {
+        val start = findStartXref()
+        if (start < 0) return false
+        val pending: array<int> = [start]
+        val seen = Map<int, int>()
+        var cursor = 0
+        var any = false
+        while (cursor < pending.size && cursor < 1024) {
+            var offset = pending[cursor]
+            cursor = cursor + 1
+            if (!seen.has(offset)) {
+                seen.set(offset, 1)
+                var section = readSection(offset, pending)
+                if (section == 0 && headerAt > 0) section = readSection(offset + headerAt, pending)
+                if (section == 0) {
+                    if (cursor == 1) return false
+                    warn("damaged older cross-reference section")
+                } else {
+                    any = true
+                    if (trailer == 0) trailer = section
+                }
+            }
+        }
+        any && hasKey(trailer, "Root")
+    }
+
+    // Reads the section at `offset`. Returns its trailer dictionary, or 0.
+    fun readSection(offset: int, var pending: array<int>): int {
+        if (offset < 0 || offset >= data.size) return 0
+        val lx = PdfLexer(data, offset)
+        skipSpace(lx)
+        if (pdfStartsWithAt(data, lx.pos, "xref")) {
+            lx.pos = lx.pos + 4
+            return readTable(lx, pending)
+        }
+        readStreamSection(lx.pos, pending)
+    }
+
+    fun readTable(var lx: PdfLexer, var pending: array<int>): int {
+        val n = data.size
+        while (true) {
+            skipSpace(lx)
+            if (lx.pos >= n) return 0
+            if (pdfStartsWithAt(data, lx.pos, "trailer")) break
+            var p = lx.pos
+            var firstNumber = 0
+            val b0 = p
+            while (p < n && isDigit(data[p]) && p - b0 < 12) {
+                firstNumber = firstNumber * 10 + (data[p] - 48)
+                p = p + 1
+            }
+            if (p == b0) return 0
+            while (p < n && isSpace(data[p])) p = p + 1
+            var count = 0
+            val b1 = p
+            while (p < n && isDigit(data[p]) && p - b1 < 12) {
+                count = count * 10 + (data[p] - 48)
+                p = p + 1
+            }
+            if (p == b1) return 0
+            lx.pos = p
+            for (i in 0 until count) {
+                skipSpace(lx)
+                p = lx.pos
+                var offset = 0
+                val a0 = p
+                while (p < n && isDigit(data[p]) && p - a0 < 12) {
+                    offset = offset * 10 + (data[p] - 48)
+                    p = p + 1
+                }
+                if (p == a0) return 0
+                while (p < n && isSpace(data[p])) p = p + 1
+                var gen = 0
+                val a1 = p
+                while (p < n && isDigit(data[p]) && p - a1 < 7) {
+                    gen = gen * 10 + (data[p] - 48)
+                    p = p + 1
+                }
+                if (p == a1) return 0
+                while (p < n && isSpace(data[p])) p = p + 1
+                if (p >= n) return 0
+                val flag = data[p]
+                lx.pos = p + 1
+                if (flag == 110) addEntry(firstNumber + i, 1, offset, gen)
+                else if (flag == 102) addEntry(firstNumber + i, 0, 0, gen)
+                else return 0
+            }
+        }
+        lx.pos = lx.pos + 7
+        val saved = currentNumber
+        currentNumber = -2
+        val dict = parseValue(lx, true, 0)
+        currentNumber = saved
+        if (kinds[dict] != PDF_DICT) return 0
+        val hybrid = get(dict, "XRefStm")
+        if (hybrid != 0) pending.append(intOf(hybrid, -1))
+        val prev = get(dict, "Prev")
+        if (prev != 0) pending.append(intOf(prev, -1))
+        dict
+    }
+
+    // Older sections never overwrite what newer ones said.
+    fun addEntry(number: int, kind: int, a: int, b: int): void {
+        if (number < 0 || number > 8388607 || xrefEntries > 8388608) return
+        xrefEntries = xrefEntries + 1
+        if (xrefOffset.has(number) || xrefStream.has(number) || xrefFree.has(number)) return
+        if (kind == 0) xrefFree.set(number, 1)
+        else if (kind == 1) {
+            xrefOffset.set(number, a)
+            xrefGeneration.set(number, b)
+        } else if (kind == 2) {
+            xrefStream.set(number, a)
+            xrefIndex.set(number, b)
+        }
+    }
+
+    fun readStreamSection(at: int, var pending: array<int>): int {
+        val saved = currentNumber
+        val id = parseIndirectAtRaw(at)
+        currentNumber = saved
+        if (id <= 0 || kinds[id] != PDF_STREAM || !isName(get(id, "Type"), "XRef")) return 0
+        val body = decodeStreamRaw(id, true)
+        val widths = get(id, "W")
+        val w0 = intOf(arrayAt(widths, 0), 1)
+        val w1 = intOf(arrayAt(widths, 1), 0)
+        val w2 = intOf(arrayAt(widths, 2), 0)
+        val rowSize = w0 + w1 + w2
+        if (w0 < 0 || w1 < 0 || w2 < 0 || w0 > 8 || w1 > 8 || w2 > 8 || rowSize == 0) return 0
+        val size = intOf(get(id, "Size"), 0)
+        val index = get(id, "Index")
+        val sections: array<int> = []
+        if (index != 0) {
+            for (i in 0 until arraySize(index)) sections.append(intOf(arrayAt(index, i), 0))
+        } else {
+            sections.append(0)
+            sections.append(size)
+        }
+        var pos = 0
+        var s = 0
+        while (s + 1 < sections.size) {
+            val base = sections[s]
+            val count = sections[s + 1]
+            var i = 0
+            while (i < count && pos + rowSize <= body.size) {
+                var kind = 1
+                if (w0 > 0) kind = fieldAt(body, pos, w0)
+                val a = fieldAt(body, pos + w0, w1)
+                val b = fieldAt(body, pos + w0 + w1, w2)
+                addEntry(base + i, kind, a, b)
+                pos = pos + rowSize
+                i = i + 1
+            }
+            s = s + 2
+        }
+        val prev = get(id, "Prev")
+        if (prev != 0) pending.append(intOf(prev, -1))
+        first[id]
+    }
+
+    fun fieldAt(body: string, at: int, width: int): int {
+        var v = 0
+        for (i in 0 until width) v = (v << 8) | body[at + i]
+        v
+    }
+
+    // Cross-reference streams are never encrypted.
+    fun parseIndirectAtRaw(at: int): int {
+        val saved = stringMethod
+        stringMethod = 0
+        val id = parseIndirectAt(at, -1)
+        stringMethod = saved
+        id
+    }
+
+    // --- Repair ------------------------------------------------------------
+
+    // Rebuilds the cross-reference by scanning for "N G obj", later definitions
+    // winning, then finds object streams, the trailer and the catalog.
+    fun repair(): void {
+        repaired = true
+        warn("cross-references damaged; the file was scanned instead")
+        xrefOffset.clear()
+        xrefGeneration.clear()
+        xrefStream.clear()
+        xrefIndex.clear()
+        xrefFree.clear()
+        objectCache.clear()
+        objectBusy.clear()
+        objectStreamData.clear()
+        objectStreamFirst.clear()
+        objectStreamOffsets.clear()
+        trailer = 0
+        val numbers: array<int> = []
+        var at = data.indexOf("obj")
+        val n = data.size
+        while (at >= 0) {
+            // Walk back over "N G " before the keyword.
+            var p = at - 1
+            if (p >= 0 && (at + 3 >= n || !isRegular(data[at + 3]) || data[at + 3] == 60 || isDigit(data[at + 3]))) {
+                while (p >= 0 && isSpace(data[p])) p = p - 1
+                val genEnd = p
+                while (p >= 0 && isDigit(data[p]) && genEnd - p < 7) p = p - 1
+                val hasGen = p < genEnd
+                val spaces = p
+                while (p >= 0 && isSpace(data[p])) p = p - 1
+                if (hasGen && p < spaces) {
+                    val numEnd = p
+                    while (p >= 0 && isDigit(data[p]) && numEnd - p < 10) p = p - 1
+                    if (p < numEnd) {
+                        var number = 0
+                        for (k in p + 1 until numEnd + 1) number = number * 10 + (data[k] - 48)
+                        if (number <= 8388607) {
+                            if (!xrefOffset.has(number)) numbers.append(number)
+                            xrefOffset.set(number, p + 1)
+                        }
+                    }
+                }
+            }
+            at = data.indexOf("obj", at + 3)
+        }
+        // Newest trailer with a Root wins.
+        var t = data.lastIndexOf("trailer")
+        var tail = data.size
+        var attempts = 0
+        while (t >= 0 && trailer == 0 && attempts < 16) {
+            attempts = attempts + 1
+            val lx = PdfLexer(data, t + 7)
+            val saved = currentNumber
+            currentNumber = -2
+            val dict = parseValue(lx, true, 0)
+            currentNumber = saved
+            if (kinds[dict] == PDF_DICT && hasKey(dict, "Root")) trailer = dict
+            tail = t
+            t = if (tail > 0) data.slice(0, tail).lastIndexOf("trailer") else -1
+        }
+        // A file with only stream sections has its trailer entries in those.
+        val objectStreams: array<int> = []
+        var catalog = 0
+        var encryptRef = 0
+        for (number in numbers) {
+            val offset = xrefOffset.get(number) ?? -1
+            val lx = PdfLexer(data, offset)
+            val mark = kinds.size
+            val markReals = reals.size
+            val markTexts = texts.size
+            val markChildren = children.size
+            val savedMethod = stringMethod
+            stringMethod = 0
+            var keep = false
+            arenaGrew = false
+            val id = parseIndirectAt(offset, number)
+            stringMethod = savedMethod
+            // A /Length reference cached an object above the mark: leave it all.
+            if (arenaGrew) keep = true
+            if (id > 0) {
+                if (isTypeName(id, "ObjStm")) objectStreams.append(number)
+                else if (isTypeName(id, "XRef")) {
+                    if (trailer == 0 && hasKey(id, "Root")) {
+                        trailer = first[id]
+                        keep = true
+                    }
+                } else if (isTypeName(id, "Catalog")) catalog = number
+            }
+            if (!keep) {
+                release(mark, markReals, markTexts, markChildren)
+            }
+        }
+        if (trailer == 0) {
+            // The catalog, once found, stands in for a trailer.
+            val dict = node(PDF_DICT, children.size, 1)
+            children.append(textNode(PDF_NAME, "Root"))
+            children.append(node(PDF_REF, catalog, 0))
+            trailer = dict
+        }
+        for (stream in objectStreams) {
+            if (!hasKey(trailer, "Encrypt") || fileKey != "") registerObjectStream(stream)
+        }
+        if (catalog == 0) {
+            for (number in xrefStream.keys()) {
+                val id = loadObject(number)
+                if (isTypeName(id, "Catalog")) catalog = number
+            }
+        }
+        if (!hasCatalog() && catalog != 0) {
+            val dict = node(PDF_DICT, children.size, 1)
+            children.append(textNode(PDF_NAME, "Root"))
+            children.append(node(PDF_REF, catalog, 0))
+            trailer = dict
+        }
+        return
+    }
+
+    fun hasCatalog(): bool = kinds[dictOf(get(trailer, "Root"))] == PDF_DICT
+
+    fun isTypeName(id: int, name: string): bool {
+        val d = dictOf(id)
+        if (d == 0) return false
+        val begin = first[d]
+        for (i in 0 until second[d]) {
+            if (texts[first[children[begin + i * 2]]] == "Type") {
+                val v = children[begin + i * 2 + 1]
+                return kinds[v] == PDF_NAME && texts[first[v]] == name
+            }
+        }
+        false
+    }
+
+    fun registerObjectStream(stream: int): void {
+        if (!prepareObjectStream(stream)) return
+        val offsets = objectStreamOffsets.get(stream)
+        if (offsets == null) return
+        var i = 0
+        while (i + 1 < offsets.size) {
+            val number = offsets[i]
+            // A top-level definition later in the file is newer only sometimes;
+            // the scan can't tell, so a loose object wins.
+            if (number >= 0 && number <= 8388607 && !xrefOffset.has(number)) {
+                xrefStream.set(number, stream)
+                xrefIndex.set(number, i / 2)
+            }
+            i = i + 2
+        }
+        return
+    }
+
+    // --- Filters -----------------------------------------------------------
+
+    fun filterNames(id: int): array<string> {
+        val names: array<string> = []
+        var filter = getResolved(id, "Filter")
+        if (filter == 0) filter = getResolved(id, "F")
+        if (kinds[filter] == PDF_NAME) names.append(texts[first[filter]])
+        else if (kinds[filter] == PDF_ARRAY) {
+            for (i in 0 until arraySize(filter)) {
+                if (i < 32) names.append(nameOf(arrayAt(filter, i)))
+            }
+        }
+        names
+    }
+
+    fun filterParams(id: int, index: int): int {
+        var params = getResolved(id, "DecodeParms")
+        if (params == 0) params = getResolved(id, "DP")
+        if (kinds[params] == PDF_ARRAY) return resolve(arrayAt(params, index))
+        if (index == 0) params else 0
+    }
+
+    // The bytes of a stream with encryption and every filter removed. A filter
+    // meant for images (DCT, JPX, CCITT, JBIG2) can't be undone here; use
+    // decodeStreamPartly for those.
+    fun decodeStream(id: int): string = decodeStreamRaw(id, false)
+
+    fun decodeStreamRaw(id: int, skipCrypt: bool): string {
+        val part = decodeStreamPartly(id, skipCrypt)
+        part.data
+    }
+
+    fun rawStreamBytes(id: int, skipCrypt: bool): string {
+        val v = resolve(id)
+        if (kinds[v] != PDF_STREAM) return ""
+        val index = second[v]
+        var raw = data.slice(streamBegin[index], streamEnd[index])
+        if (!skipCrypt && encrypted && fileKey != "") {
+            val isMetadataPlain = !encryptMetadata && isName(get(v, "Type"), "Metadata")
+            if (!isMetadataPlain && !isName(get(v, "Type"), "XRef")) {
+                var names = filterNames(v)
+                var identity = names.size > 0 && names[0] == "Crypt" && nameOf(get(filterParams(v, 0), "Name")) != "StdCF"
+                if (!identity) raw = decryptWith(streamMethod, raw, streamNumber[index], streamGeneration[index])
+            }
+        }
+        raw
+    }
+
+    fun decodeStreamPartly(id: int, skipCrypt: bool): PdfDecodedStream {
+        val v = resolve(id)
+        if (kinds[v] != PDF_STREAM) return PdfDecodedStream("", "", false)
+        var content = rawStreamBytes(v, skipCrypt)
+        applyFilters(v, content)
+    }
+
+    // Runs the filters of dictionary `v` over `start`, as far as they go.
+    fun applyFilters(v: int, start: string): PdfDecodedStream {
+        var content = start
+        var good = true
+        val names = filterNames(v)
+        for (i in 0 until names.size) {
+            val filter = names[i]
+            val limit = remainingBudget()
+            if (limit <= 0) {
+                warn("decoding budget used up")
+                return PdfDecodedStream("", "", false)
+            }
+            val params = filterParams(v, i)
+            if (filter == "FlateDecode" || filter == "Fl") {
+                val r = pdfZlibDecompress(content, limit)
+                if (!r.ok) {
+                    warn("flate stream: ${r.error}")
+                    good = false
+                }
+                val u = pdfUndoPredictor(r.data, intOf(get(params, "Predictor"), 1), intOf(get(params, "Colors"), 1),
+                    intOf(get(params, "BitsPerComponent"), 8), intOf(get(params, "Columns"), 1))
+                content = u.data
+                if (!u.ok) good = false
+            } else if (filter == "LZWDecode" || filter == "LZW") {
+                val r = pdfDecodeLzw(content, intOf(get(params, "EarlyChange"), 1) != 0, limit)
+                if (!r.ok) {
+                    warn("LZW stream: ${r.error}")
+                    good = false
+                }
+                val u = pdfUndoPredictor(r.data, intOf(get(params, "Predictor"), 1), intOf(get(params, "Colors"), 1),
+                    intOf(get(params, "BitsPerComponent"), 8), intOf(get(params, "Columns"), 1))
+                content = u.data
+                if (!u.ok) good = false
+            } else if (filter == "ASCII85Decode" || filter == "A85") {
+                val r = pdfDecodeAscii85(content, limit)
+                content = r.data
+                if (!r.ok) good = false
+            } else if (filter == "ASCIIHexDecode" || filter == "AHx") {
+                val r = pdfDecodeAsciiHex(content, limit)
+                content = r.data
+                if (!r.ok) good = false
+            } else if (filter == "RunLengthDecode" || filter == "RL") {
+                val r = pdfDecodeRunLength(content, limit)
+                content = r.data
+                if (!r.ok) good = false
+            } else if (filter == "Crypt") {
+            } else {
+                return PdfDecodedStream(content, filter, good)
+            }
+            decodedTotal = decodedTotal + content.size
+        }
+        PdfDecodedStream(content, "", good)
+    }
+
+    fun remainingBudget(): int {
+        val left = options.maxTotalBytes - decodedTotal
+        if (left < options.maxStreamBytes) left else options.maxStreamBytes
+    }
+
+    // --- Encryption --------------------------------------------------------
+
+    fun decryptString(raw: string): string {
+        if (!encrypted || fileKey == "" || currentNumber < 0 || stringMethod == 0) return raw
+        if (currentNumber == encryptNumber) return raw
+        decryptWith(stringMethod, raw, currentNumber, currentGeneration)
+    }
+
+    // Method: 0 none, 1 RC4, 2 AES-128, 3 AES-256.
+    fun decryptWith(method: int, raw: string, number: int, generation: int): string {
+        if (method == 0) return raw
+        if (method == 3) return pdfAesDecryptPayload(fileKey, raw)
+        val suffix = byteBuffer()
+        suffix.appendByteValue(number & 255)
+        suffix.appendByteValue((number >> 8) & 255)
+        suffix.appendByteValue((number >> 16) & 255)
+        suffix.appendByteValue(generation & 255)
+        suffix.appendByteValue((generation >> 8) & 255)
+        if (method == 2) suffix.appendText("sAlT")
+        val digest = md5(fileKey + suffix.toText())
+        val keySize = if (fileKey.size + 5 < 16) fileKey.size + 5 else 16
+        val key = digest.slice(0, keySize)
+        if (method == 1) pdfRc4(key, raw) else pdfAesDecryptPayload(key, raw)
+    }
+
+    fun cryptMethodFor(dict: int, filterKey: string): int {
+        val name = nameOf(get(dict, filterKey))
+        if (name == "" || name == "Identity") return 0
+        val entry = get(getResolved(dict, "CF"), name)
+        val cfm = nameOf(get(entry, "CFM"))
+        if (cfm == "V2") return 1
+        if (cfm == "AESV2") return 2
+        if (cfm == "AESV3") return 3
+        0
+    }
+
+    // Returns false when the file is encrypted and can't be opened.
+    fun setupEncryption(): bool {
+        val reference = get(trailer, "Encrypt")
+        if (reference == 0) return true
+        encrypted = true
+        if (kinds[reference] == PDF_REF) encryptNumber = first[reference]
+        val dict = resolve(reference)
+        if (kinds[dict] != PDF_DICT) {
+            warn("encryption dictionary unreadable")
+            return false
+        }
+        if (nameOf(get(dict, "Filter")) != "Standard") {
+            error = "unsupported security handler ${nameOf(get(dict, "Filter"))}"
+            return false
+        }
+        val revision = intOf(get(dict, "R"), 0)
+        val versionField = intOf(get(dict, "V"), 0)
+        cryptRevision = revision
+        encryptMetadata = boolOf(get(dict, "EncryptMetadata"), true)
+        var keyLength = intOf(get(dict, "Length"), 40)
+        if (keyLength < 40) keyLength = keyLength * 8
+        if (versionField == 1) keyLength = 40
+        if (versionField == 1 || versionField == 2 || versionField == 3) {
+            stringMethod = 1
+            streamMethod = 1
+        } else if (versionField == 4 || versionField == 5) {
+            stringMethod = cryptMethodFor(dict, "StrF")
+            streamMethod = cryptMethodFor(dict, "StmF")
+            if (versionField == 4) {
+                keyLength = 128
+                val named = get(getResolved(dict, "CF"), nameOf(get(dict, "StmF")))
+                if (intOf(get(named, "Length"), 16) * 8 < 128 && streamMethod == 1) keyLength = intOf(get(named, "Length"), 16) * 8
+            }
+        } else {
+            error = "unsupported encryption version $versionField"
+            return false
+        }
+        val keyBytes = keyLength / 8
+        if (revision < 5 && (keyBytes < 5 || keyBytes > 16)) {
+            error = "invalid encryption key length"
+            return false
+        }
+        val o = stringOf(get(dict, "O"))
+        val u = stringOf(get(dict, "U"))
+        val password = options.password
+        var key = ""
+        if (revision >= 5) key = revision6Key(dict, password, o, u, revision)
+        else key = legacyKey(dict, password, o, u, revision, keyBytes)
+        if (key == "") {
+            needsPassword = true
+            return false
+        }
+        fileKey = key
+        // What was read before the key existed holds undecrypted strings.
+        objectCache.clear()
+        objectStreamData.clear()
+        objectStreamFirst.clear()
+        objectStreamOffsets.clear()
+        if (repaired) {
+            for (number in xrefOffset.keys()) {
+                val offset = xrefOffset.get(number) ?? -1
+                val saved = stringMethod
+                stringMethod = 0
+                val id = parseIndirectAt(offset, number)
+                stringMethod = saved
+                if (id > 0 && isTypeName(id, "ObjStm")) registerObjectStream(number)
+            }
+        }
+        true
+    }
+
+    fun legacyPad(password: string): string {
+        val pad = pdfHexDecode("28BF4E5E4E758A4164004E56FFFA01082E2E00B6D0683E802F0CA9FE6453697A")
+        val bytes = pdfPasswordBytes(password)
+        if (bytes.size >= 32) bytes.slice(0, 32) else bytes + pad.slice(0, 32 - bytes.size)
+    }
+
+    fun pdfPasswordBytes(password: string): string {
+        val out = byteBuffer()
+        for (cp in pdfUtf8Decode(password)) out.appendByteValue(if (cp < 256) cp else 63)
+        out.toText()
+    }
+
+    fun legacyKey(dict: int, password: string, o: string, u: string, revision: int, keyBytes: int): string {
+        val fromUser = legacyUserKey(dict, legacyPad(password), o, u, revision, keyBytes)
+        if (fromUser != "") return fromUser
+        // The owner password unwraps the user password stored in /O.
+        var hash = md5(legacyPad(password))
+        if (revision >= 3) for (i in 0 until 50) hash = md5(hash)
+        val ownerKey = hash.slice(0, keyBytes)
+        var userPad = o.slice(0, if (o.size < 32) o.size else 32)
+        if (revision == 2) userPad = pdfRc4(ownerKey, userPad)
+        else {
+            var round = 19
+            while (round >= 0) {
+                userPad = pdfRc4(xorKey(ownerKey, round), userPad)
+                round = round - 1
+            }
+        }
+        legacyUserKey(dict, userPad, o, u, revision, keyBytes)
+    }
+
+    fun xorKey(key: string, value: int): string {
+        val out = byteBuffer()
+        for (b in key) out.appendByteValue(b ^ value)
+        out.toText()
+    }
+
+    fun legacyUserKey(dict: int, padded: string, o: string, u: string, revision: int, keyBytes: int): string {
+        val input = byteBuffer()
+        input.appendText(padded)
+        input.appendText(o.slice(0, if (o.size < 32) o.size else 32))
+        val p = intOf(get(dict, "P"), 0) & 0xffffffff
+        input.appendByteValue(p & 255)
+        input.appendByteValue((p >> 8) & 255)
+        input.appendByteValue((p >> 16) & 255)
+        input.appendByteValue((p >> 24) & 255)
+        input.appendText(stringOf(arrayAt(get(trailer, "ID"), 0)))
+        if (revision >= 4 && !encryptMetadata) input.appendText("\xff\xff\xff\xff")
+        var hash = md5(input.toText())
+        if (revision >= 3) for (i in 0 until 50) hash = md5(hash.slice(0, keyBytes))
+        val key = hash.slice(0, keyBytes)
+        // Algorithms 6 with 4 or 5: the key is right when it reproduces /U.
+        val idBytes = stringOf(arrayAt(get(trailer, "ID"), 0))
+        val pad = pdfHexDecode("28BF4E5E4E758A4164004E56FFFA01082E2E00B6D0683E802F0CA9FE6453697A")
+        if (revision == 2) {
+            if (pdfRc4(key, pad) == u.slice(0, if (u.size < 32) u.size else 32)) return key
+            return ""
+        }
+        var check = pdfRc4(key, md5(pad + idBytes))
+        for (i in 1 until 20) check = pdfRc4(xorKey(key, i), check)
+        if (u.size >= 16 && check == u.slice(0, 16)) key else ""
+    }
+
+    fun revision6Hash(password: string, salt: string, extra: string, revision: int): string =
+        if (revision == 5) sha256(password + salt + extra) else pdfHashR6(password, salt, extra)
+
+    fun revision6Key(dict: int, password: string, o: string, u: string, revision: int): string {
+        if (u.size < 48 || o.size < 48) return ""
+        val bytes = if (password.size > 127) password.slice(0, 127) else password
+        val zeroIv = "\0".repeat(16)
+        val uValue = u.slice(0, 32)
+        val oValue = o.slice(0, 32)
+        val uEntry = u.slice(0, 48)
+        if (revision6Hash(bytes, o.slice(32, 40), uEntry, revision) == oValue) {
+            val oe = stringOf(get(dict, "OE"))
+            if (oe.size < 32) return ""
+            return pdfAesCbcDecrypt(revision6Hash(bytes, o.slice(40, 48), uEntry, revision), zeroIv, oe.slice(0, 32))
+        }
+        if (revision6Hash(bytes, u.slice(32, 40), "", revision) == uValue) {
+            val ue = stringOf(get(dict, "UE"))
+            if (ue.size < 32) return ""
+            return pdfAesCbcDecrypt(revision6Hash(bytes, u.slice(40, 48), "", revision), zeroIv, ue.slice(0, 32))
+        }
+        ""
+    }
+
+    // --- Pages -------------------------------------------------------------
+
+    fun buildPages(): bool {
+        root = getResolved(trailer, "Root")
+        if (kinds[root] != PDF_DICT) return false
+        pages.clear()
+        val tree = getResolved(root, "Pages")
+        if (dictOf(tree) == 0) return false
+        val seen = Map<int, int>()
+        walkPages(get(root, "Pages"), 0, 0, 0, 0, 0, seen)
+        pages.size > 0
+    }
+
+    fun walkPages(reference: int, resources: int, media: int, crop: int, rotate: int, depth: int, var seen: Map<int, int>): void {
+        if (depth > options.maxDepth || pages.size >= options.maxPages) return
+        val node = resolve(reference)
+        if (dictOf(node) == 0) return
+        if (kinds[reference] == PDF_REF) {
+            if (seen.has(first[reference])) return
+            seen.set(first[reference], 1)
+        }
+        val ownResources = get(node, "Resources")
+        val ownMedia = get(node, "MediaBox")
+        val ownCrop = get(node, "CropBox")
+        val ownRotate = get(node, "Rotate")
+        val nextResources = if (ownResources != 0) ownResources else resources
+        val nextMedia = if (ownMedia != 0) ownMedia else media
+        val nextCrop = if (ownCrop != 0) ownCrop else crop
+        val nextRotate = if (ownRotate != 0) intOf(ownRotate, 0) else rotate
+        val kids = getResolved(node, "Kids")
+        if (kinds[kids] == PDF_ARRAY && !isName(get(node, "Type"), "Page")) {
+            for (i in 0 until arraySize(kids)) {
+                if (pages.size >= options.maxPages) return
+                walkPages(arrayAt(kids, i), nextResources, nextMedia, nextCrop, nextRotate, depth + 1, seen)
+            }
+            return
+        }
+        pages.append(PdfPageEntry(dictOf(node), nextResources, nextMedia, nextCrop, nextRotate))
+        return
+    }
+}
+
+class PdfDecodedStream(
+    val data: string,
+    // The first filter still to apply, "" when fully decoded.
+    val stoppedAt: string,
+    val ok: bool
+)
+
+// Opens a PDF held in memory. This doesn't panic on any input: check `ok`, and
+// `error` when it is false; `needsPassword` tells that case apart.
+fun pdfOpen(data: string, options: PdfReadOptions = PdfReadOptions()): PdfReader {
+    val reader = PdfReader(data, options)
+    reader.open()
+    reader
+}

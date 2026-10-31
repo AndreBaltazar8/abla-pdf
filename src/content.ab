@@ -1,0 +1,959 @@
+// Running page content: the graphics and text state needed to place text and
+// images, and fonts decoded far enough to turn character codes into Unicode.
+
+import "abla/bytes"
+import "abla/math"
+import "abla/float"
+import "abla/text"
+
+class PdfTextItem(
+    // UTF-8; characters a font doesn't explain come out as U+FFFD.
+    val text: string,
+    // Where the baseline starts, in points from the page's bottom left corner.
+    val x: f64,
+    val y: f64,
+    // The advance of the whole item, in points.
+    val width: f64,
+    // The size on the page, after all scaling.
+    val fontSize: f64,
+    val fontName: string,
+    // Degrees counterclockwise; 0 for ordinary horizontal text.
+    val angle: f64,
+    // The text rendering mode; 3 is invisible text, as OCR layers use.
+    val renderMode: int
+)
+
+class PdfImageRef(
+    val name: string,
+    val width: int,
+    val height: int,
+    val bitsPerComponent: int,
+    val colorSpace: string,
+    val isMask: bool,
+    val hasSoftMask: bool,
+    // The image's placement: lower left corner and size on the page, in points.
+    val x: f64,
+    val y: f64,
+    val drawWidth: f64,
+    val drawHeight: f64,
+    // The stream object in the reader, or -1 for an inline image.
+    val objectId: int,
+    val inlineData: string,
+    val inlineFilter: string
+)
+
+class PdfImageData(
+    val data: string,
+    // "raw" samples, or the codec they still need: "jpeg", "jpx", "ccitt", "jbig2".
+    val encoding: string,
+    val ok: bool
+)
+
+class PdfPageContent(val items: array<PdfTextItem>, val images: array<PdfImageRef>)
+
+class PdfFontDecoder(
+    val name: string,
+    val composite: bool,
+    val type3: bool,
+    val encoding: array<int>,
+    val toUnicode: Map<int, string>,
+    val cidMap: Map<int, int>,
+    val cidToUnicode: Map<int, int>,
+    val spaces: array<int>,
+    val simpleWidths: array<f64>,
+    val cidWidths: Map<int, f64>,
+    val defaultWidth: f64,
+    // Glyph space to text space.
+    val widthScale: f64,
+    // Codes of a two-byte CMap such as UniGB-UCS2-H are Unicode already.
+    val unicodeCodes: bool
+)
+
+private class Mat(val a: f64, val b: f64, val c: f64, val d: f64, val e: f64, val f: f64)
+
+private fun matMul(m: Mat, n: Mat): Mat = Mat(
+    m.a * n.a + m.b * n.c, m.a * n.b + m.b * n.d,
+    m.c * n.a + m.d * n.c, m.c * n.b + m.d * n.d,
+    m.e * n.a + m.f * n.c + n.e, m.e * n.b + m.f * n.d + n.f
+)
+
+private fun identity(): Mat = Mat(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+private class Saved(
+    val ctm: Mat, val font: int, val size: f64, val charSpace: f64, val wordSpace: f64,
+    val hScale: f64, val leading: f64, val rise: f64, val mode: int
+)
+
+private class Interp(
+    var ctm: Mat,
+    var tm: Mat,
+    var tlm: Mat,
+    var font: int,
+    var size: f64,
+    var charSpace: f64,
+    var wordSpace: f64,
+    var hScale: f64,
+    var leading: f64,
+    var rise: f64,
+    var mode: int,
+    val saved: array<Saved>,
+    val items: array<PdfTextItem>,
+    val images: array<PdfImageRef>,
+    var operators: int
+)
+
+private var GLYPH_LIST_READY = false
+private val GLYPH_LIST = Map<string, int>()
+
+private fun loadGlyphList(): void {
+    if (GLYPH_LIST_READY) return
+    GLYPH_LIST_READY = true
+    for (entry in PDF_GLYPH_LIST.split(";")) {
+        val at = entry.indexOf(":")
+        if (at > 0) {
+            var v = 0
+            for (b in entry.slice(at + 1, entry.size)) v = v * 16 + pdfHexDigit(b)
+            GLYPH_LIST.set(entry.slice(0, at), v)
+        }
+    }
+    return
+}
+
+// The Unicode value of a glyph name, 0 when unknown.
+fun pdfGlyphNameToUnicode(name: string): int {
+    loadGlyphList()
+    var base = name
+    val dot = name.indexOf(".")
+    if (dot > 0) base = name.slice(0, dot)
+    val known = GLYPH_LIST.get(base)
+    if (known != null) return known
+    if (base.size >= 7 && base.startsWith("uni")) {
+        var v = 0
+        for (b in base.slice(3, 7)) {
+            val d = pdfHexDigit(b)
+            if (d < 0) return 0
+            v = v * 16 + d
+        }
+        return v
+    }
+    if (base.size >= 5 && base.size <= 7 && base.startsWith("u")) {
+        var v = 0
+        for (b in base.slice(1, base.size)) {
+            val d = pdfHexDigit(b)
+            if (d < 0) return 0
+            v = v * 16 + d
+        }
+        if (v <= 0x10ffff) return v
+    }
+    0
+}
+
+private fun stripSubset(name: string): string =
+    if (name.size > 7 && name[6] == 43) name.slice(7, name.size) else name
+
+private fun bytesValue(text: string): int {
+    var v = 0
+    val n = if (text.size > 4) 4 else text.size
+    for (i in 0 until n) v = (v << 8) | text[i]
+    v
+}
+
+private fun cpText(cp: int): string {
+    val out = byteBuffer()
+    out.pdfAppendUtf8(cp)
+    out.toText()
+}
+
+// Adds what a CMap stream defines to the maps. Entries are capped per font.
+fun PdfReader.pdfParseCMap(
+    content: string, var toUnicode: Map<int, string>, var cidMap: Map<int, int>, var spaces: array<int>
+): void {
+    val savedNumber = currentNumber
+    currentNumber = -2
+    val markNodes = kinds.size
+    val markReals = reals.size
+    val markTexts = texts.size
+    val markChildren = children.size
+    val lx = PdfLexer(content, 0)
+    val stack: array<int> = []
+    var budget = 300000
+    var running = true
+    while (running && budget > 0) {
+        val v = parseValue(lx, false, 0)
+        val kind = kinds[v]
+        if (kind == PDF_END) running = false
+        else if (kind != PDF_KEYWORD) {
+            if (stack.size < 1024) stack.append(v)
+        } else {
+            val word = texts[first[v]]
+            if (word == "endcodespacerange") {
+                var i = 0
+                while (i + 1 < stack.size) {
+                    val low = stringOfNode(stack[i])
+                    val high = stringOfNode(stack[i + 1])
+                    if (spaces.size < 96 && low.size >= 1 && low.size <= 4 && low.size == high.size) {
+                        spaces.append(low.size)
+                        spaces.append(bytesValue(low))
+                        spaces.append(bytesValue(high))
+                    }
+                    i = i + 2
+                }
+            } else if (word == "endbfchar") {
+                var i = 0
+                while (i + 1 < stack.size) {
+                    val target = bfTarget(stack[i + 1])
+                    if (target != "") toUnicode.set(bytesValue(stringOfNode(stack[i])), target)
+                    budget = budget - 1
+                    i = i + 2
+                }
+            } else if (word == "endbfrange") {
+                var i = 0
+                while (i + 2 < stack.size) {
+                    val low = bytesValue(stringOfNode(stack[i]))
+                    val high = bytesValue(stringOfNode(stack[i + 1]))
+                    val target = stack[i + 2]
+                    var code = low
+                    var offset = 0
+                    while (code <= high && offset < 65536 && budget > 0) {
+                        if (kinds[target] == PDF_ARRAY) {
+                            val t = bfTarget(arrayAt(target, offset))
+                            if (t != "") toUnicode.set(code, t)
+                        } else {
+                            val raw = stringOfNode(target)
+                            if (raw.size >= 2) {
+                                val last = (raw[raw.size - 2] << 8) | raw[raw.size - 1]
+                                val bumped = last + offset
+                                val head = raw.slice(0, raw.size - 2)
+                                val tail = byteBuffer()
+                                tail.pdfAppendU16(bumped & 0xffff)
+                                toUnicode.set(code, pdfUtf16ToUtf8(head + tail.toText()))
+                            } else if (raw.size == 1) toUnicode.set(code, cpText(raw[0] + offset))
+                        }
+                        code = code + 1
+                        offset = offset + 1
+                        budget = budget - 1
+                    }
+                    i = i + 3
+                }
+            } else if (word == "endcidrange") {
+                var i = 0
+                while (i + 2 < stack.size) {
+                    val low = bytesValue(stringOfNode(stack[i]))
+                    val high = bytesValue(stringOfNode(stack[i + 1]))
+                    val cid = intOfNode(stack[i + 2])
+                    var code = low
+                    while (code <= high && code - low < 65536 && budget > 0) {
+                        cidMap.set(code, cid + code - low)
+                        code = code + 1
+                        budget = budget - 1
+                    }
+                    i = i + 3
+                }
+            } else if (word == "endcidchar") {
+                var i = 0
+                while (i + 1 < stack.size) {
+                    cidMap.set(bytesValue(stringOfNode(stack[i])), intOfNode(stack[i + 1]))
+                    budget = budget - 1
+                    i = i + 2
+                }
+            }
+            stack.clear()
+            if (word == "stream" || word == "endcmap") running = false
+        }
+    }
+    release(markNodes, markReals, markTexts, markChildren)
+    currentNumber = savedNumber
+    return
+}
+
+fun PdfReader.stringOfNode(id: int): string = if (kinds[id] == PDF_STRING) texts[first[id]] else ""
+
+fun PdfReader.intOfNode(id: int): int = if (kinds[id] == PDF_INT) first[id] else 0
+
+private fun PdfReader.bfTarget(id: int): string {
+    val k = kinds[id]
+    if (k == PDF_STRING) {
+        val raw = texts[first[id]]
+        if (raw.size == 1) return cpText(raw[0])
+        return pdfUtf16ToUtf8(raw)
+    }
+    if (k == PDF_NAME) {
+        val cp = pdfGlyphNameToUnicode(texts[first[id]])
+        if (cp != 0) return cpText(cp)
+    }
+    ""
+}
+
+private fun PdfReader.simpleEncoding(fontDict: int, subtype: string, baseName: string): array<int> {
+    val table = filledArray(256, 0)
+    val encoding = resolve(get(fontDict, "Encoding"))
+    var baseEncoding = ""
+    if (kinds[encoding] == PDF_NAME) baseEncoding = texts[first[encoding]]
+    else if (kinds[encoding] == PDF_DICT) baseEncoding = nameOf(get(encoding, "BaseEncoding"))
+    val plain = stripSubset(baseName)
+    for (code in 0 until 256) {
+        table[code] = when (baseEncoding) {
+            "WinAnsiEncoding" -> PDF_ENCODING_WINANSI[code]
+            "MacRomanEncoding" -> PDF_ENCODING_MACROMAN[code]
+            "StandardEncoding" -> PDF_ENCODING_STANDARD[code]
+            else -> if (plain == "Symbol") PDF_ENCODING_SYMBOL[code]
+                else if (plain == "ZapfDingbats") 0
+                else if (subtype == "TrueType") PDF_ENCODING_WINANSI[code]
+                else PDF_ENCODING_STANDARD[code]
+        }
+    }
+    if (kinds[encoding] == PDF_DICT) {
+        val differences = getResolved(encoding, "Differences")
+        var code = 0
+        for (i in 0 until arraySize(differences)) {
+            val entry = resolve(arrayAt(differences, i))
+            if (kinds[entry] == PDF_INT) code = first[entry]
+            else if (kinds[entry] == PDF_NAME) {
+                if (code >= 0 && code < 256) table[code] = pdfGlyphNameToUnicode(texts[first[entry]])
+                code = code + 1
+            }
+        }
+    }
+    table
+}
+
+private fun standardWidthsFor(plain: string): array<int>? {
+    if (plain.startsWith("Helvetica-Bold") || plain.startsWith("Arial-Bold") || plain.startsWith("Arial,Bold")) return PDF_WIDTHS_HELVETICA_BOLD
+    if (plain.startsWith("Helvetica") || plain.startsWith("Arial")) return PDF_WIDTHS_HELVETICA
+    if (plain == "Times-Bold") return PDF_WIDTHS_TIMES_BOLD
+    if (plain == "Times-Italic") return PDF_WIDTHS_TIMES_ITALIC
+    if (plain == "Times-BoldItalic") return PDF_WIDTHS_TIMES_BOLDITALIC
+    if (plain.startsWith("Times")) return PDF_WIDTHS_TIMES_ROMAN
+    null
+}
+
+// What the embedded TrueType program says about its glyphs, as CID to Unicode,
+// for composite fonts without a ToUnicode map.
+private fun PdfReader.embeddedCidUnicode(descendant: int): Map<int, int> {
+    val out = Map<int, int>()
+    val program = getResolved(getResolved(descendant, "FontDescriptor"), "FontFile2")
+    if (kinds[program] != PDF_STREAM) return out
+    val parsed = pdfParseTrueType(decodeStream(program))
+    if (!parsed.ok) return out
+    val gidToCid = Map<int, int>()
+    val mapping = getResolved(descendant, "CIDToGIDMap")
+    var direct = true
+    if (kinds[mapping] == PDF_STREAM) {
+        direct = false
+        val table = decodeStream(mapping)
+        var cid = 0
+        while (cid * 2 + 1 < table.size && cid < 65536) {
+            val gid = pdfU16(table, cid * 2)
+            if (gid != 0 && !gidToCid.has(gid)) gidToCid.set(gid, cid)
+            cid = cid + 1
+        }
+    }
+    for (cp in parsed.cmap.keys()) {
+        val gid = parsed.cmap.get(cp) ?? 0
+        val cid = if (direct) gid else (gidToCid.get(gid) ?? -1)
+        if (cid > 0 && !out.has(cid)) out.set(cid, cp)
+    }
+    out
+}
+
+private fun PdfReader.buildFont(fontDict: int): PdfFontDecoder {
+    val subtype = nameOf(get(fontDict, "Subtype"))
+    val baseName = nameOf(get(fontDict, "BaseFont"))
+    val toUnicode = Map<int, string>()
+    val cidMap = Map<int, int>()
+    val spaces: array<int> = []
+    val scratchCid = Map<int, int>()
+    val scratchSpaces: array<int> = []
+    val toUnicodeStream = getResolved(fontDict, "ToUnicode")
+    if (kinds[toUnicodeStream] == PDF_STREAM) {
+        pdfParseCMap(decodeStream(toUnicodeStream), toUnicode, scratchCid, scratchSpaces)
+    }
+    if (subtype == "Type0") {
+        val descendant = resolve(arrayAt(get(fontDict, "DescendantFonts"), 0))
+        val encoding = resolve(get(fontDict, "Encoding"))
+        var unicodeCodes = false
+        if (kinds[encoding] == PDF_STREAM) {
+            val scratch = Map<int, string>()
+            pdfParseCMap(decodeStream(encoding), scratch, cidMap, spaces)
+        } else if (kinds[encoding] == PDF_NAME) {
+            val n = texts[first[encoding]]
+            unicodeCodes = n.contains("UCS2") || n.contains("UTF16")
+        }
+        val widths = Map<int, f64>()
+        val w = getResolved(descendant, "W")
+        var i = 0
+        val count = arraySize(w)
+        var total = 0
+        while (i < count && total < 400000) {
+            val start = intOf(arrayAt(w, i), 0)
+            val second = resolve(arrayAt(w, i + 1))
+            if (kinds[second] == PDF_ARRAY) {
+                for (k in 0 until arraySize(second)) {
+                    widths.set(start + k, numberOf(arrayAt(second, k), 0.0))
+                    total = total + 1
+                }
+                i = i + 2
+            } else {
+                val last = intOf(second, start)
+                val value = numberOf(arrayAt(w, i + 2), 0.0)
+                var cid = start
+                while (cid <= last && total < 400000) {
+                    widths.set(cid, value)
+                    cid = cid + 1
+                    total = total + 1
+                }
+                i = i + 3
+            }
+        }
+        val cidToUnicode = if (toUnicode.size == 0) embeddedCidUnicode(descendant) else Map<int, int>()
+        return PdfFontDecoder(baseName, true, false, [], toUnicode, cidMap, cidToUnicode, spaces, [],
+            widths, numberOf(get(descendant, "DW"), 1000.0), 0.001, unicodeCodes)
+    }
+    val encoding = simpleEncoding(fontDict, subtype, baseName)
+    val simple = filledArray(256, -1.0)
+    val firstChar = intOf(get(fontDict, "FirstChar"), 0)
+    val widthsArray = getResolved(fontDict, "Widths")
+    for (i in 0 until arraySize(widthsArray)) {
+        val code = firstChar + i
+        if (code >= 0 && code < 256) simple[code] = numberOf(arrayAt(widthsArray, i), 0.0)
+    }
+    var fallback = numberOf(get(getResolved(fontDict, "FontDescriptor"), "MissingWidth"), -1.0)
+    if (arraySize(widthsArray) == 0) {
+        val plain = stripSubset(baseName)
+        if (plain.startsWith("Courier")) {
+            fallback = 600.0
+        } else {
+            val table = standardWidthsFor(plain)
+            if (table != null) {
+                for (code in 0 until 256) {
+                    // The tables are indexed by WinAnsi code, the font by its encoding.
+                    val cp = encoding[code]
+                    var w = 0
+                    if (cp > 0) {
+                        var other = 32
+                        while (other < 256) {
+                            if (PDF_ENCODING_WINANSI[other] == cp) {
+                                w = table[other]
+                                other = 256
+                            }
+                            other = other + 1
+                        }
+                    }
+                    if (w > 0) simple[code] = f64FromInt(w)
+                }
+            }
+        }
+    }
+    if (fallback < 0.0) fallback = if (arraySize(widthsArray) > 0) 0.0 else 500.0
+    var scale = 0.001
+    val type3 = subtype == "Type3"
+    if (type3) {
+        val matrix = getResolved(fontDict, "FontMatrix")
+        if (arraySize(matrix) >= 1) scale = numberOf(arrayAt(matrix, 0), 0.001)
+    }
+    PdfFontDecoder(baseName, false, type3, encoding, toUnicode, cidMap, Map<int, int>(), spaces, simple,
+        Map<int, f64>(), fallback, scale, false)
+}
+
+// The index of the font a Tf operator names, -1 for none.
+private fun PdfReader.fontFor(resources: int, name: string): int {
+    val reference = get(getResolved(resources, "Font"), name)
+    if (reference == 0) return -1
+    val dict = resolve(reference)
+    if (dictOf(dict) == 0) return -1
+    val known = fontIndex.get(dict)
+    if (known != null) return known
+    val index = fontCache.size
+    if (index >= 4096) return -1
+    fontCache.append(buildFont(dict))
+    fontIndex.set(dict, index)
+    index
+}
+
+private fun PdfReader.showText(text: string, var st: Interp): void {
+    if (st.font < 0) return
+    val font = fontCache[st.font]
+    val params = Mat(st.size * st.hScale, 0.0, 0.0, st.size, 0.0, st.rise)
+    val start = matMul(matMul(params, st.tm), st.ctm)
+    val out = byteBuffer()
+    var advance = 0.0
+    var i = 0
+    val n = text.size
+    while (i < n) {
+        var length = 1
+        var code = text[i]
+        if (font.composite) {
+            length = 2
+            if (font.spaces.size > 0) {
+                length = 0
+                var candidate = 1
+                while (candidate <= 4 && length == 0 && i + candidate <= n) {
+                    var value = 0
+                    for (k in 0 until candidate) value = (value << 8) | text[i + k]
+                    var s = 0
+                    while (s + 2 < font.spaces.size) {
+                        if (font.spaces[s] == candidate && value >= font.spaces[s + 1] && value <= font.spaces[s + 2]) length = candidate
+                        s = s + 3
+                    }
+                    candidate = candidate + 1
+                }
+                if (length == 0) length = font.spaces[0]
+            }
+            if (i + length > n) length = n - i
+            code = 0
+            for (k in 0 until length) code = (code << 8) | text[i + k]
+        }
+        i = i + length
+        var unit = font.defaultWidth
+        var mapped = font.toUnicode.get(code)
+        if (font.composite) {
+            val cid = if (font.cidMap.size > 0) (font.cidMap.get(code) ?? 0) else code
+            unit = font.cidWidths.get(cid) ?? font.defaultWidth
+            if (mapped == null) {
+                if (font.unicodeCodes) mapped = cpText(code)
+                else {
+                    val cp = font.cidToUnicode.get(cid)
+                    if (cp != null) mapped = cpText(cp)
+                }
+            }
+        } else {
+            val w = font.simpleWidths[code]
+            if (w >= 0.0) unit = w
+            if (mapped == null && font.encoding[code] != 0) mapped = cpText(font.encoding[code])
+        }
+        val shown = mapped
+        if (shown != null) out.appendText(shown)
+        else if (code != 0 || font.composite) out.appendText("\u{FFFD}")
+        val spacing = st.charSpace + (if (length == 1 && code == 32) st.wordSpace else 0.0)
+        advance = advance + (unit * font.widthScale * st.size + spacing) * st.hScale
+    }
+    moveText(advance, st)
+    val content = out.toText()
+    if (content.size > 0 && st.items.size < 1000000) {
+        val base = matMul(st.tm, st.ctm)
+        val scaleX = sqrt(base.a * base.a + base.b * base.b)
+        val scaleY = sqrt(base.c * base.c + base.d * base.d)
+        val angle = atan2(start.b, start.a) * 180.0 / mathPi
+        st.items.append(PdfTextItem(content, start.e, start.f, advance * scaleX,
+            st.size * scaleY, stripSubset(font.name), angle, st.mode))
+    }
+    return
+}
+
+private fun PdfReader.moveText(tx: f64, var st: Interp): void {
+    st.tm = matMul(Mat(1.0, 0.0, 0.0, 1.0, tx, 0.0), st.tm)
+    return
+}
+
+private fun PdfReader.nextLine(tx: f64, ty: f64, var st: Interp): void {
+    st.tlm = matMul(Mat(1.0, 0.0, 0.0, 1.0, tx, ty), st.tlm)
+    st.tm = Mat(st.tlm.a, st.tlm.b, st.tlm.c, st.tlm.d, st.tlm.e, st.tlm.f)
+    return
+}
+
+private fun PdfReader.colorSpaceName(id: int): string {
+    val v = resolve(id)
+    if (kinds[v] == PDF_NAME) return texts[first[v]]
+    if (kinds[v] == PDF_ARRAY) return nameOf(arrayAt(v, 0))
+    ""
+}
+
+private fun PdfReader.placeImage(dict: int, name: string, objectId: int, inlineData: string, filter: string, var st: Interp): void {
+    if (st.images.size >= 100000) return
+    var w = intOf(get(dict, "Width"), -1)
+    if (w < 0) w = intOf(get(dict, "W"), 0)
+    var h = intOf(get(dict, "Height"), -1)
+    if (h < 0) h = intOf(get(dict, "H"), 0)
+    var bits = intOf(get(dict, "BitsPerComponent"), -1)
+    if (bits < 0) bits = intOf(get(dict, "BPC"), 8)
+    var cs = get(dict, "ColorSpace")
+    if (cs == 0) cs = get(dict, "CS")
+    var mask = boolOf(get(dict, "ImageMask"), false)
+    if (!mask) mask = boolOf(get(dict, "IM"), false)
+    val m = st.ctm
+    // A rotated image's size is the length of the transformed unit square's sides.
+    val drawWidth = sqrt(m.a * m.a + m.b * m.b)
+    val drawHeight = sqrt(m.c * m.c + m.d * m.d)
+    st.images.append(PdfImageRef(name, w, h, bits, colorSpaceName(cs), mask, hasKey(dict, "SMask"),
+        m.e, m.f, drawWidth, drawHeight, objectId, inlineData, filter))
+    return
+}
+
+private fun isWhite(c: int): bool = c == 32 || c == 10 || c == 13 || c == 9 || c == 12 || c == 0
+
+// Reads an inline image from after BI. Leaves the lexer after its EI.
+private fun PdfReader.inlineImage(var lx: PdfLexer, var st: Interp): void {
+    val entries: array<int> = []
+    var running = true
+    while (running) {
+        val v = parseValue(lx, false, 0)
+        val kind = kinds[v]
+        if (kind == PDF_END) return
+        if (kind == PDF_KEYWORD) running = false
+        else entries.append(v)
+    }
+    val source = lx.source
+    var p = lx.pos
+    if (p < source.size && isWhite(source[p])) {
+        if (source[p] == 13 && p + 1 < source.size && source[p + 1] == 10) p = p + 1
+        p = p + 1
+    }
+    // Build a dictionary node holding the inline entries.
+    val begin = children.size
+    var pairs = 0
+    var e = 0
+    while (e + 1 < entries.size) {
+        if (kinds[entries[e]] == PDF_NAME) {
+            children.append(entries[e])
+            children.append(entries[e + 1])
+            pairs = pairs + 1
+        }
+        e = e + 2
+    }
+    val dict = node(PDF_DICT, begin, pairs)
+    var end = p
+    var found = false
+    while (!found && end + 1 < source.size) {
+        val at = source.indexOf("EI", end)
+        if (at < 0) {
+            end = source.size
+            found = true
+        } else {
+            val before = at == p || isWhite(source[at - 1])
+            val after = at + 2 >= source.size || isWhite(source[at + 2])
+            if (before && after) {
+                end = at
+                found = true
+            } else end = at + 2
+        }
+    }
+    if (!found) end = source.size
+    val raw = pdfClampedSlice(source, p, end)
+    lx.pos = if (end + 2 < source.size) end + 2 else source.size
+    val decoded = applyFilters(dict, raw)
+    placeImage(dict, "", -1, decoded.data, decoded.stoppedAt, st)
+    return
+}
+
+private fun PdfReader.doXObject(resources: int, name: string, var st: Interp, depth: int): void {
+    val xobject = getResolved(getResolved(resources, "XObject"), name)
+    if (kinds[xobject] != PDF_STREAM) return
+    val subtype = nameOf(get(xobject, "Subtype"))
+    if (subtype == "Image") {
+        placeImage(first[xobject], name, xobject, "", "", st)
+    } else if (subtype == "Form") {
+        if (depth >= 12) {
+            warn("form XObjects nested too deep")
+            return
+        }
+        val content = decodeStream(xobject)
+        val savedCtm = st.ctm
+        val depthBefore = st.saved.size
+        val matrix = getResolved(xobject, "Matrix")
+        if (arraySize(matrix) >= 6) {
+            st.ctm = matMul(Mat(
+                numberOf(arrayAt(matrix, 0)), numberOf(arrayAt(matrix, 1)), numberOf(arrayAt(matrix, 2)),
+                numberOf(arrayAt(matrix, 3)), numberOf(arrayAt(matrix, 4)), numberOf(arrayAt(matrix, 5))
+            ), savedCtm)
+        }
+        val own = getResolved(xobject, "Resources")
+        pdfRunContent(content, if (kinds[own] == PDF_DICT) own else resources, st, depth + 1)
+        st.saved.truncate(depthBefore)
+        st.ctm = Mat(savedCtm.a, savedCtm.b, savedCtm.c, savedCtm.d, savedCtm.e, savedCtm.f)
+    }
+    return
+}
+
+// Runs a content stream, adding to st.items and st.images.
+private fun PdfReader.pdfRunContent(content: string, resources: int, var st: Interp, depth: int): void {
+    val savedNumber = currentNumber
+    currentNumber = -2
+    val lx = PdfLexer(content, 0)
+    val operands: array<int> = []
+    var running = true
+    while (running) {
+        val markNodes = kinds.size
+        val markReals = reals.size
+        val markTexts = texts.size
+        val markChildren = children.size
+        arenaGrew = false
+        operands.clear()
+        var word = ""
+        while (word == "" && running) {
+            val v = parseValue(lx, false, 0)
+            val kind = kinds[v]
+            if (kind == PDF_END) running = false
+            else if (kind == PDF_KEYWORD) word = texts[first[v]]
+            else if (operands.size < 64) operands.append(v)
+            // Numbers and strings before any operator may be endless in junk.
+            if (limitHit) running = false
+        }
+        if (word != "") {
+            st.operators = st.operators + 1
+            if (st.operators > options.maxOperators) {
+                warn("too many content operators on one page")
+                running = false
+            } else runOperator(word, operands, resources, lx, st, depth)
+        }
+        if (!arenaGrew) release(markNodes, markReals, markTexts, markChildren)
+    }
+    currentNumber = savedNumber
+    return
+}
+
+private fun PdfReader.operand(operands: array<int>, index: int): f64 =
+    if (index < operands.size) numberOf(operands[index], 0.0) else 0.0
+
+private fun PdfReader.runOperator(
+    word: string, operands: array<int>, resources: int, var lx: PdfLexer, var st: Interp, depth: int
+): void {
+    when (word) {
+        "q" -> {
+            if (st.saved.size < 512) st.saved.append(Saved(
+                Mat(st.ctm.a, st.ctm.b, st.ctm.c, st.ctm.d, st.ctm.e, st.ctm.f),
+                st.font, st.size, st.charSpace, st.wordSpace, st.hScale, st.leading, st.rise, st.mode
+            ))
+        }
+        "Q" -> {
+            val count = st.saved.size
+            if (count > 0) {
+                val s = st.saved[count - 1]
+                st.ctm = Mat(s.ctm.a, s.ctm.b, s.ctm.c, s.ctm.d, s.ctm.e, s.ctm.f)
+                st.font = s.font
+                st.size = s.size
+                st.charSpace = s.charSpace
+                st.wordSpace = s.wordSpace
+                st.hScale = s.hScale
+                st.leading = s.leading
+                st.rise = s.rise
+                st.mode = s.mode
+                st.saved.truncate(count - 1)
+            }
+        }
+        "cm" -> st.ctm = matMul(Mat(operand(operands, 0), operand(operands, 1), operand(operands, 2),
+            operand(operands, 3), operand(operands, 4), operand(operands, 5)), st.ctm)
+        "BT" -> {
+            st.tm = identity()
+            st.tlm = identity()
+        }
+        "Tf" -> {
+            if (operands.size >= 2) {
+                st.font = fontFor(resources, nameOf(operands[0]))
+                st.size = operand(operands, 1)
+            }
+        }
+        "Tc" -> st.charSpace = operand(operands, 0)
+        "Tw" -> st.wordSpace = operand(operands, 0)
+        "Tz" -> st.hScale = operand(operands, 0) / 100.0
+        "TL" -> st.leading = operand(operands, 0)
+        "Ts" -> st.rise = operand(operands, 0)
+        "Tr" -> st.mode = f64ToInt(operand(operands, 0))
+        "Td" -> nextLine(operand(operands, 0), operand(operands, 1), st)
+        "TD" -> {
+            st.leading = 0.0 - operand(operands, 1)
+            nextLine(operand(operands, 0), operand(operands, 1), st)
+        }
+        "Tm" -> {
+            st.tlm = Mat(operand(operands, 0), operand(operands, 1), operand(operands, 2),
+                operand(operands, 3), operand(operands, 4), operand(operands, 5))
+            st.tm = Mat(st.tlm.a, st.tlm.b, st.tlm.c, st.tlm.d, st.tlm.e, st.tlm.f)
+        }
+        "T*" -> nextLine(0.0, 0.0 - st.leading, st)
+        "Tj" -> {
+            if (operands.size >= 1) showText(stringOfNode(operands[0]), st)
+        }
+        "'" -> {
+            nextLine(0.0, 0.0 - st.leading, st)
+            if (operands.size >= 1) showText(stringOfNode(operands[0]), st)
+        }
+        "\"" -> {
+            st.wordSpace = operand(operands, 0)
+            st.charSpace = operand(operands, 1)
+            nextLine(0.0, 0.0 - st.leading, st)
+            if (operands.size >= 3) showText(stringOfNode(operands[2]), st)
+        }
+        "TJ" -> {
+            if (operands.size >= 1) {
+                val list = operands[0]
+                for (i in 0 until arraySize(list)) {
+                    val entry = arrayAt(list, i)
+                    val k = kinds[entry]
+                    if (k == PDF_STRING) showText(texts[first[entry]], st)
+                    else if (k == PDF_INT || k == PDF_REAL) {
+                        val adjust = numberOf(entry, 0.0)
+                        moveText(0.0 - adjust / 1000.0 * st.size * st.hScale, st)
+                    }
+                }
+            }
+        }
+        "Do" -> {
+            if (operands.size >= 1) doXObject(resources, nameOf(operands[0]), st, depth)
+        }
+        "BI" -> inlineImage(lx, st)
+        else -> {}
+    }
+    return
+}
+
+fun PdfReader.pageContentBytes(index: int): string {
+    val contents = resolve(get(pages[index].dict, "Contents"))
+    if (kinds[contents] == PDF_STREAM) return decodeStream(contents)
+    val out = byteBuffer()
+    for (i in 0 until arraySize(contents)) {
+        if (i < 65536) {
+            out.appendText(decodeStream(arrayAt(contents, i)))
+            out.appendText("\n")
+        }
+    }
+    out.toText()
+}
+
+// Runs the normal appearance of each annotation, as a viewer draws form fields
+// and markup over the page.
+private fun PdfReader.runAnnotationAppearances(index: int, resources: int, var st: Interp): void {
+    val list = getResolved(pages[index].dict, "Annots")
+    for (i in 0 until arraySize(list)) {
+        if (i >= 65536 || st.operators > options.maxOperators) return
+        val annotation = resolve(arrayAt(list, i))
+        var appearance = getResolved(getResolved(annotation, "AP"), "N")
+        if (kinds[appearance] == PDF_DICT) {
+            // A dictionary of states, such as a checkbox's: AS picks the one shown.
+            appearance = getResolved(appearance, nameOf(get(annotation, "AS")))
+        }
+        val hidden = (intOf(get(annotation, "F"), 0) & 2) != 0
+        if (kinds[appearance] == PDF_STREAM && !hidden) {
+            val rect = getResolved(annotation, "Rect")
+            val bbox = getResolved(appearance, "BBox")
+            st.ctm = Mat(1.0, 0.0, 0.0, 1.0,
+                numberOf(arrayAt(rect, 0)) - numberOf(arrayAt(bbox, 0)),
+                numberOf(arrayAt(rect, 1)) - numberOf(arrayAt(bbox, 1)))
+            val own = getResolved(appearance, "Resources")
+            val before = st.saved.size
+            pdfRunContent(decodeStream(appearance), if (kinds[own] == PDF_DICT) own else resources, st, 1)
+            st.saved.truncate(before)
+        }
+    }
+    return
+}
+
+// Text and images of a page, in the order the page draws them. With
+// `annotations`, what its annotations show too, such as filled form fields.
+fun PdfReader.pageContent(index: int, annotations: bool = false): PdfPageContent {
+    val items: array<PdfTextItem> = []
+    val images: array<PdfImageRef> = []
+    if (index < 0 || index >= pages.size) return PdfPageContent(items, images)
+    val st = Interp(identity(), identity(), identity(), -1, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0, [], items, images, 0)
+    pdfRunContent(pageContentBytes(index), resolve(pages[index].resources), st, 0)
+    if (annotations) runAnnotationAppearances(index, resolve(pages[index].resources), st)
+    PdfPageContent(st.items, st.images)
+}
+
+fun PdfReader.pageTextItems(index: int, annotations: bool = false): array<PdfTextItem> {
+    val content = pageContent(index, annotations)
+    val out: array<PdfTextItem> = []
+    for (item in content.items) out.append(item)
+    out
+}
+
+fun PdfReader.pageImages(index: int): array<PdfImageRef> {
+    val content = pageContent(index)
+    val out: array<PdfImageRef> = []
+    for (image in content.images) out.append(image)
+    out
+}
+
+private fun sortedByKey(keys: array<f64>, order: array<int>): array<int> {
+    val current: array<int> = []
+    for (o in order) current.append(o)
+    val n = current.size
+    val next = filledArray(n, 0)
+    var width = 1
+    while (width < n) {
+        var low = 0
+        var out = 0
+        while (low < n) {
+            val mid = if (low + width < n) low + width else n
+            val high = if (low + 2 * width < n) low + 2 * width else n
+            var a = low
+            var b = mid
+            while (a < mid || b < high) {
+                if (a < mid && (b >= high || keys[current[a]] <= keys[current[b]])) {
+                    next[out] = current[a]
+                    a = a + 1
+                } else {
+                    next[out] = current[b]
+                    b = b + 1
+                }
+                out = out + 1
+            }
+            low = high
+        }
+        for (i in 0 until n) current[i] = next[i]
+        width = width * 2
+    }
+    current
+}
+
+// The page's text top to bottom and left to right, one line per baseline, with
+// spaces where the layout leaves gaps. For exact placement use pageTextItems.
+fun PdfReader.pageText(index: int, annotations: bool = false): string {
+    val items = pageTextItems(index, annotations)
+    val horizontal: array<int> = []
+    val others: array<int> = []
+    val down = filledArray(items.size, 0.0)
+    val across = filledArray(items.size, 0.0)
+    for (i in 0 until items.size) {
+        val item = items[i]
+        down[i] = 0.0 - item.y
+        across[i] = item.x
+        if (item.angle > -1.0 && item.angle < 1.0) horizontal.append(i) else others.append(i)
+    }
+    val order = sortedByKey(down, horizontal)
+    val out = byteBuffer()
+    var cursor = 0
+    while (cursor < order.size) {
+        val lineY = items[order[cursor]].y
+        val tolerance = items[order[cursor]].fontSize * 0.4
+        val members: array<int> = []
+        while (cursor < order.size && lineY - items[order[cursor]].y <= tolerance) {
+            members.append(order[cursor])
+            cursor = cursor + 1
+        }
+        var end = 0.0
+        var started = false
+        for (m in sortedByKey(across, members)) {
+            val item = items[m]
+            if (started && item.x - end > item.fontSize * 0.2) out.appendText(" ")
+            out.appendText(item.text)
+            end = item.x + item.width
+            started = true
+        }
+        out.appendText("\n")
+    }
+    for (i in others) {
+        out.appendText(items[i].text)
+        out.appendText("\n")
+    }
+    out.toText()
+}
+
+fun PdfReader.imageData(image: PdfImageRef): PdfImageData {
+    var data = image.inlineData
+    var stopped = image.inlineFilter
+    var good = true
+    if (image.objectId >= 0) {
+        val decoded = decodeStreamPartly(image.objectId, false)
+        data = decoded.data
+        stopped = decoded.stoppedAt
+        good = decoded.ok
+    }
+    val encoding = when (stopped) {
+        "" -> "raw"
+        "DCTDecode", "DCT" -> "jpeg"
+        "JPXDecode" -> "jpx"
+        "CCITTFaxDecode", "CCF" -> "ccitt"
+        "JBIG2Decode" -> "jbig2"
+        else -> stopped
+    }
+    PdfImageData(data, encoding, good)
+}

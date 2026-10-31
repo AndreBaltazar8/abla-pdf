@@ -1,0 +1,137 @@
+// Damages valid files in many reproducible ways and reads whatever comes out. A
+// panic ends the process and fails the test, so reading each result completely
+// is the whole check. Arguments, for longer runs: first seed, seed count, a
+// directory of extra PDFs.
+
+import "abla/test"
+import "abla/io"
+import "abla/fs"
+import "abla/bytes"
+import "abla/process"
+import "abla/text"
+import "../src/pdf.ab"
+
+class Rng(var state: int) {
+    fun next(bound: int): int {
+        state = (state * 6364136223846793005 + 1442695040888963407)
+        val v = (state >>> 33) & 0x7fffffff
+        if (bound <= 0) 0 else v % bound
+    }
+}
+
+val TOKENS = ["obj", "endobj", "stream", "endstream", "<<", ">>", "[", "]", "/Length 99999999", "/Kids", "/Type /Page",
+    "/Pages", "R", "0 0 R", "99999999999999999999", "-1", "/Filter /FlateDecode", "xref", "trailer", "startxref",
+    "/Contents", "/Font", "/W [1 2 3", "/Prev 0", "/Size -5", "/Encrypt", "BT", "ET", "Tj", "(", ")", "<", ">", "Do", "BI", "ID", "EI",
+    "/N 999999", "/First -4", "/Index [0 99999999]", "1 0 obj", "/Predictor 15", "/Columns 0", "/Colors 999"]
+
+fun mutate(data: string, var rng: Rng): string {
+    val edits = 1 + rng.next(4)
+    var current = data
+    for (e in 0 until edits) {
+        val at = rng.next(current.size)
+        val kind = rng.next(7)
+        when (kind) {
+            0 -> {
+                val b = byteBuffer()
+                b.appendByteValue(rng.next(256))
+                current = current.slice(0, at) + b.toText() + current.slice(if (at + 1 < current.size) at + 1 else at, current.size)
+            }
+            1 -> {
+                val stop = at + rng.next(200)
+                current = current.slice(0, at) + current.slice(if (stop < current.size) stop else current.size, current.size)
+            }
+            2 -> current = current.slice(0, at) + TOKENS[rng.next(TOKENS.size)] + " " + current.slice(at, current.size)
+            3 -> current = current.slice(0, at)
+            4 -> {
+                val from = rng.next(current.size)
+                val stop = from + rng.next(500)
+                current = current.slice(0, at) + current.slice(from, if (stop < current.size) stop else current.size) + current.slice(at, current.size)
+            }
+            5 -> {
+                // Change a digit, the likeliest way to send an offset or length astray.
+                var p = at
+                while (p < current.size && (current[p] < 48 || current[p] > 57)) p = p + 1
+                if (p < current.size) {
+                    val b = byteBuffer()
+                    b.appendByteValue(48 + rng.next(10))
+                    current = current.slice(0, p) + b.toText() + current.slice(p + 1, current.size)
+                }
+            }
+            else -> {
+                val token = TOKENS[rng.next(TOKENS.size)]
+                val stop = if (at + token.size < current.size) at + token.size else current.size
+                current = current.slice(0, at) + token + current.slice(stop, current.size)
+            }
+        }
+    }
+    current
+}
+
+fun readAll(data: string, password: string): int {
+    val doc = pdfOpen(data, PdfReadOptions(password = password, maxTotalBytes = 67108864, maxStreamBytes = 16777216, maxOperators = 2000000))
+    if (!doc.ok) return 0
+    doc.metadata()
+    doc.xmpMetadata()
+    doc.formFields()
+    var total = 0
+    val count = if (doc.pageCount() < 8) doc.pageCount() else 8
+    for (i in 0 until count) {
+        doc.pageMediaBox(i)
+        doc.pageCropBox(i)
+        doc.pageRotation(i)
+        doc.pageAnnotations(i)
+        total = total + doc.pageText(i, true).size
+        for (image in doc.pageImages(i)) total = total + doc.imageData(image).data.size
+    }
+    total
+}
+
+fun sampleFile(compress: bool, objectStreams: bool): string {
+    val doc = PdfDocument(compress = compress, objectStreams = objectStreams, title = "Fuzz ação")
+    val font = doc.embedFont(path("tests/fixtures/DejaVuSans-Latin.ttf").readText())
+    val page = PdfPage()
+    page.text(font, 12.0, 50.0, 700.0, "Olá São João")
+    page.text(doc.standardFont("Times-Roman"), 12.0, 50.0, 680.0, "Second font")
+    page.image(doc.addRawImage(2, 2, 1, "abcd"), 10.0, 10.0, 20.0, 20.0)
+    page.link(0.0, 0.0, 10.0, 10.0, "https://example.com")
+    doc.addPage(page)
+    doc.toBytes()
+}
+
+fun main: int {
+    val firstSeed = if (processArgumentCount() > 1) f64SeedArg(processArgument(1)) else 1
+    val seeds = if (processArgumentCount() > 2) f64SeedArg(processArgument(2)) else 1500
+    val inputs = [sampleFile(true, false), sampleFile(false, false), sampleFile(true, true), sampleFile(false, true)]
+    val corpus = path(if (processArgumentCount() > 3) processArgument(3) else "tests/corpus/generated")
+    if (corpus.exists()) {
+        for (entry in corpus.entries()) {
+            val small = entry.info().size < 200000
+            val hostile = entry.name().startsWith("hostile-")
+            if (entry.text.endsWith(".pdf") && small && !hostile) inputs.append(entry.readText())
+        }
+    }
+    println("${inputs.size} inputs")
+    for (input in inputs) expect(readAll(input, "secret") >= 0, "input reads")
+    var seed = firstSeed
+    val progress = path("build/fuzz-seed.txt")
+    while (seed < firstSeed + seeds) {
+        val rng = Rng(seed * 2654435761)
+        val input = inputs[rng.next(inputs.size)]
+        val damaged = mutate(input, rng)
+        // The input that killed a run stays behind to reproduce it.
+        if (processArgumentCount() > 1) {
+            progress.writeText("$seed\n")
+            path("build/fuzz-last.pdf").writeText(damaged)
+        }
+        readAll(damaged, if (seed % 3 == 0) "secret" else "")
+        seed = seed + 1
+    }
+    println("$seeds seeds from $firstSeed")
+    testsPassed()
+}
+
+fun f64SeedArg(text: string): int {
+    var v = 0
+    for (b in text) v = v * 10 + (b - 48)
+    v
+}
