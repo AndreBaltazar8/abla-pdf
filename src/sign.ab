@@ -1,0 +1,904 @@
+// PAdES baseline signatures (B-B level): an incremental update with a CMS
+// detached SignedData over the file, signed through the PdfSigner interface so
+// that the private key can live in a smart card or HSM.
+//
+// A qualified electronic signature takes a qualified certificate and a qualified
+// signature creation device, which nothing here provides. The verifier checks the
+// file's integrity and the cryptographic signature against the certificate inside
+// the signature. It does not build a chain to a trust anchor, check revocation or
+// consult the EU Trusted List, so a valid result says nothing of who signed.
+
+import "abla/bytes"
+import "abla/crypto"
+import "abla/date"
+import "abla/text"
+
+val PDF_OID_SHA256 = "2.16.840.1.101.3.4.2.1"
+val PDF_OID_SHA384 = "2.16.840.1.101.3.4.2.2"
+val PDF_OID_SHA512 = "2.16.840.1.101.3.4.2.3"
+val PDF_OID_RSA = "1.2.840.113549.1.1.1"
+val PDF_OID_RSA_SHA256 = "1.2.840.113549.1.1.11"
+val PDF_OID_RSA_SHA384 = "1.2.840.113549.1.1.12"
+val PDF_OID_RSA_SHA512 = "1.2.840.113549.1.1.13"
+val PDF_OID_ECDSA_SHA256 = "1.2.840.10045.4.3.2"
+
+// --- DER ---------------------------------------------------------------------
+
+private fun derLength(n: int): string {
+    val out = byteBuffer()
+    if (n < 128) out.appendByteValue(n)
+    else if (n < 256) {
+        out.appendByteValue(0x81)
+        out.appendByteValue(n)
+    } else if (n < 65536) {
+        out.appendByteValue(0x82)
+        out.pdfAppendU16(n)
+    } else {
+        out.appendByteValue(0x83)
+        out.appendByteValue((n >> 16) & 255)
+        out.pdfAppendU16(n & 0xffff)
+    }
+    out.toText()
+}
+
+private fun der(tag: int, content: string): string = byteEncode(tag) + derLength(content.size) + content
+
+private fun derSeq(parts: array<string>): string = der(0x30, textJoin(parts))
+
+private fun derOid(dotted: string): string {
+    val parts = dotted.split(".")
+    val out = byteBuffer()
+    var nums: array<int> = []
+    for (p in parts) {
+        var v = 0
+        for (b in p) v = v * 10 + (b - 48)
+        nums.append(v)
+    }
+    out.appendByteValue(nums[0] * 40 + nums[1])
+    for (i in 2 until nums.size) {
+        val v = nums[i]
+        var shift = 63
+        while (shift > 0 && (v >> shift) == 0) shift = shift - 7
+        while (shift > 0) {
+            out.appendByteValue(0x80 | ((v >> shift) & 127))
+            shift = shift - 7
+        }
+        out.appendByteValue(v & 127)
+    }
+    der(6, out.toText())
+}
+
+private fun derOidText(bytes: string): string {
+    if (bytes.size == 0) return ""
+    val out = byteBuffer()
+    val firstByte = bytes[0]
+    out.appendInt(if (firstByte >= 80) 2 else firstByte / 40)
+    out.appendText(".")
+    out.appendInt(if (firstByte >= 80) firstByte - 80 else firstByte % 40)
+    var v = 0
+    for (i in 1 until bytes.size) {
+        v = (v << 7) | (bytes[i] & 127)
+        if ((bytes[i] & 0x80) == 0) {
+            out.appendText(".")
+            out.appendInt(v)
+            v = 0
+        }
+    }
+    out.toText()
+}
+
+private class Der(val tag: int, val begin: int, val end: int, val start: int) {
+    fun ok(): bool = tag >= 0
+}
+
+// The item at `at`, staying within `limit`; tag -1 when malformed.
+private fun derAt(data: string, at: int, limit: int): Der {
+    val bad = Der(-1, at, at, at)
+    if (at < 0 || at + 2 > limit || limit > data.size) return bad
+    val tag = data[at]
+    if ((tag & 31) == 31) return bad
+    val first = data[at + 1]
+    var p = at + 2
+    var length = first
+    if (first == 0x80) return bad
+    if (first > 0x80) {
+        val count = first & 127
+        if (count > 4 || p + count > limit) return bad
+        length = 0
+        for (i in 0 until count) length = (length << 8) | data[p + i]
+        p = p + count
+    }
+    if (p + length > limit) return bad
+    Der(tag, p, p + length, at)
+}
+
+private fun derNext(data: string, item: Der, limit: int): Der = derAt(data, item.end, limit)
+
+private fun derInside(data: string, item: Der): Der = derAt(data, item.begin, item.end)
+
+// --- Big integers: little-endian 28-bit limbs, Montgomery multiplication -----------
+
+private val LIMB_BITS = 28
+private val LIMB_MASK = 0xfffffff
+
+private fun limbsFromBytes(bytes: string): array<int> {
+    val out: array<int> = []
+    var accumulator = 0
+    var bits = 0
+    var i = bytes.size - 1
+    while (i >= 0) {
+        accumulator = accumulator | (bytes[i] << bits)
+        bits = bits + 8
+        if (bits >= LIMB_BITS) {
+            out.append(accumulator & LIMB_MASK)
+            accumulator = accumulator >> LIMB_BITS
+            bits = bits - LIMB_BITS
+        }
+        i = i - 1
+    }
+    if (bits > 0) out.append(accumulator)
+    out
+}
+
+private fun bytesFromLimbs(limbs: array<int>, size: int): string {
+    val digits = filledArray(size, 0)
+    var accumulator = 0
+    var bits = 0
+    var at = size - 1
+    var i = 0
+    while (at >= 0) {
+        while (bits < 8 && i < limbs.size) {
+            accumulator = accumulator | (limbs[i] << bits)
+            bits = bits + LIMB_BITS
+            i = i + 1
+        }
+        digits[at] = accumulator & 255
+        accumulator = accumulator >> 8
+        bits = if (bits >= 8) bits - 8 else 0
+        at = at - 1
+    }
+    pdfIntsToBytes(digits)
+}
+
+private fun compareLimbs(a: array<int>, b: array<int>): int {
+    var i = a.size - 1
+    while (i >= 0) {
+        val y = if (i < b.size) b[i] else 0
+        if (a[i] != y) return if (a[i] > y) 1 else -1
+        i = i - 1
+    }
+    0
+}
+
+private fun subtractInPlace(var a: array<int>, b: array<int>): void {
+    var borrow = 0
+    for (i in 0 until a.size) {
+        var v = a[i] - borrow - (if (i < b.size) b[i] else 0)
+        borrow = if (v < 0) 1 else 0
+        if (v < 0) v = v + (1 << LIMB_BITS)
+        a[i] = v
+    }
+    return
+}
+
+private class Modulus(val n: array<int>, val inverse: int, val rSquared: array<int>)
+
+private fun modulusFor(n: array<int>): Modulus {
+    // -n^-1 mod 2^28 by Newton's iteration.
+    val low = n[0]
+    var x = 1
+    for (i in 0 until 6) x = (x * (2 - low * x)) & LIMB_MASK
+    val inverse = (0 - x) & LIMB_MASK
+    // R^2 mod n by doubling, starting from 1.
+    val value = filledArray(n.size, 0)
+    value[0] = 1
+    for (i in 0 until 2 * n.size * LIMB_BITS) {
+        var carry = 0
+        for (k in 0 until value.size) {
+            val v = (value[k] << 1) | carry
+            value[k] = v & LIMB_MASK
+            carry = v >> LIMB_BITS
+        }
+        if (carry != 0 || compareLimbs(value, n) >= 0) subtractInPlace(value, n)
+    }
+    Modulus(n, inverse, value)
+}
+
+private fun montMul(a: array<int>, b: array<int>, m: Modulus): array<int> {
+    val n = m.n
+    val size = n.size
+    val t = filledArray(size + 2, 0)
+    for (i in 0 until size) {
+        var carry = 0
+        val bi = if (i < b.size) b[i] else 0
+        for (j in 0 until size) {
+            val v = t[j] + (if (j < a.size) a[j] else 0) * bi + carry
+            t[j] = v & LIMB_MASK
+            carry = v >> LIMB_BITS
+        }
+        var v = t[size] + carry
+        t[size] = v & LIMB_MASK
+        t[size + 1] = t[size + 1] + (v >> LIMB_BITS)
+        val q = (t[0] * m.inverse) & LIMB_MASK
+        v = t[0] + q * n[0]
+        carry = v >> LIMB_BITS
+        for (j in 1 until size) {
+            val w = t[j] + q * n[j] + carry
+            t[j - 1] = w & LIMB_MASK
+            carry = w >> LIMB_BITS
+        }
+        v = t[size] + carry
+        t[size - 1] = v & LIMB_MASK
+        t[size] = t[size + 1] + (v >> LIMB_BITS)
+        t[size + 1] = 0
+    }
+    val out = filledArray(size, 0)
+    for (i in 0 until size) out[i] = t[i]
+    if (t[size] != 0 || compareLimbs(out, n) >= 0) subtractInPlace(out, n)
+    out
+}
+
+// base^exponent mod the modulus, both byte strings, big-endian. The exponent is
+// walked square-and-multiply-always, which hides little: see PdfRsaSigner.
+private fun modPow(base: string, exponent: string, modulusBytes: string): string {
+    val n = limbsFromBytes(modulusBytes)
+    if (n.size == 0 || (n[0] & 1) == 0) return ""
+    val m = modulusFor(n)
+    val inMont = montMul(limbsFromBytes(base), m.rSquared, m)
+    val one = filledArray(n.size, 0)
+    one[0] = 1
+    var result = montMul(one, m.rSquared, m)
+    for (byte in exponent) {
+        var bit = 7
+        while (bit >= 0) {
+            result = montMul(result, result, m)
+            val multiplied = montMul(result, inMont, m)
+            if (((byte >> bit) & 1) == 1) result = multiplied
+            bit = bit - 1
+        }
+    }
+    bytesFromLimbs(montMul(result, one, m), modulusBytes.size)
+}
+
+private fun stripZeros(bytes: string): string {
+    var i = 0
+    while (i < bytes.size && bytes[i] == 0) i = i + 1
+    bytes.slice(i, bytes.size)
+}
+
+private fun digestInfo(oid: string, digest: string): string =
+    derSeq([derSeq([derOid(oid), der(5, "")]), der(4, digest)])
+
+private fun pkcs1Encode(oid: string, digest: string, size: int): string {
+    val info = digestInfo(oid, digest)
+    if (size < info.size + 11) return ""
+    "\0\x01" + "\xff".repeat(size - info.size - 3) + "\0" + info
+}
+
+// --- Signers ---------------------------------------------------------------------
+
+// Whatever holds the private key.
+interface PdfSigner {
+    // DER X.509 certificates, the signer's own first.
+    fun certificates(): array<string>
+    // The dotted signature algorithm OID: PDF_OID_RSA_SHA256 or PDF_OID_ECDSA_SHA256.
+    fun algorithmOid(): string
+    // A signature over `message`, hashing it with SHA-256 as the algorithm says.
+    fun sign(message: string): string
+}
+
+// RSA PKCS#1 v1.5 with SHA-256 on a key in memory, for tests and development.
+// This pure Abla code isn't hardened against timing or memory disclosure: keep
+// keys that matter in a device and implement PdfSigner over it.
+class PdfRsaSigner(val modulus: string, val exponent: string, val chain: array<string>) : PdfSigner {
+    fun certificates(): array<string> {
+        val out: array<string> = []
+        for (c in chain) out.append(c)
+        out
+    }
+
+    fun algorithmOid(): string = PDF_OID_RSA_SHA256
+
+    fun sign(message: string): string {
+        val encoded = pkcs1Encode(PDF_OID_SHA256, sha256(message), modulus.size)
+        if (encoded == "") return ""
+        modPow(encoded, exponent, modulus)
+    }
+}
+
+// Reads a private key in DER, PKCS#8 or PKCS#1. `ok` is false on anything else.
+class PdfRsaKey(val ok: bool, val modulus: string, val exponent: string)
+
+fun pdfParseRsaPrivateKey(der: string): PdfRsaKey {
+    val bad = PdfRsaKey(false, "", "")
+    val outer = derAt(der, 0, der.size)
+    if (outer.tag != 0x30) return bad
+    val version = derInside(der, outer)
+    if (version.tag != 2) return bad
+    val next = derNext(der, version, outer.end)
+    var sequence = der
+    var body = outer
+    if (next.tag == 0x30) {
+        // PKCS#8: the PKCS#1 key is an octet string after the algorithm.
+        val octets = derNext(der, next, outer.end)
+        if (octets.tag != 4) return bad
+        val inner = der.slice(octets.begin, octets.end)
+        sequence = inner
+        body = derAt(inner, 0, inner.size)
+        if (body.tag != 0x30) return bad
+    }
+    val v = derInside(sequence, body)
+    val n = derNext(sequence, v, body.end)
+    val e = derNext(sequence, n, body.end)
+    val d = derNext(sequence, e, body.end)
+    if (v.tag != 2 || n.tag != 2 || e.tag != 2 || d.tag != 2) return bad
+    PdfRsaKey(true, stripZeros(sequence.slice(n.begin, n.end)), stripZeros(sequence.slice(d.begin, d.end)))
+}
+
+// A DER body from PEM text; the first block when there are several.
+fun pdfPemToDer(pem: string): string {
+    val begin = pem.indexOf("-----BEGIN")
+    if (begin < 0) return ""
+    val bodyAt = pem.indexOf("\n", begin)
+    val end = pem.indexOf("-----END", begin)
+    if (bodyAt < 0 || end < bodyAt) return ""
+    val clean = byteBuffer()
+    for (b in pem.slice(bodyAt, end)) if (b > 32) clean.appendByteValue(b)
+    base64Decode(clean.toText())
+}
+
+class PdfCertificate(
+    val ok: bool,
+    val serialDer: string,
+    val issuerDer: string,
+    val subjectDer: string,
+    // The subject's common name.
+    val commonName: string,
+    val notBefore: string,
+    val notAfter: string,
+    val keyAlgorithm: string,
+    val rsaModulus: string,
+    val rsaExponent: string
+)
+
+private fun nameCommonName(data: string, name: Der): string {
+    var rdn = derInside(data, name)
+    while (rdn.ok() && rdn.tag == 0x31) {
+        val attr = derInside(data, rdn)
+        if (attr.tag == 0x30) {
+            val oid = derInside(data, attr)
+            val value = derNext(data, oid, attr.end)
+            if (oid.tag == 6 && derOidText(data.slice(oid.begin, oid.end)) == "2.5.4.3" && value.ok()) {
+                return data.slice(value.begin, value.end)
+            }
+        }
+        rdn = derAt(data, rdn.end, name.end)
+    }
+    ""
+}
+
+fun pdfParseCertificate(data: string): PdfCertificate {
+    val bad = PdfCertificate(false, "", "", "", "", "", "", "", "", "")
+    val outer = derAt(data, 0, data.size)
+    if (outer.tag != 0x30) return bad
+    val tbs = derInside(data, outer)
+    if (tbs.tag != 0x30) return bad
+    var item = derInside(data, tbs)
+    if (item.tag == 0xa0) item = derNext(data, item, tbs.end)
+    if (item.tag != 2) return bad
+    val serial = item
+    val algorithm = derNext(data, serial, tbs.end)
+    val issuer = derNext(data, algorithm, tbs.end)
+    val validity = derNext(data, issuer, tbs.end)
+    val subject = derNext(data, validity, tbs.end)
+    val spki = derNext(data, subject, tbs.end)
+    if (algorithm.tag != 0x30 || issuer.tag != 0x30 || validity.tag != 0x30 || subject.tag != 0x30 || spki.tag != 0x30) return bad
+    val before = derInside(data, validity)
+    val after = derNext(data, before, validity.end)
+    val keyAlgorithm = derInside(data, spki)
+    val keyOid = derInside(data, keyAlgorithm)
+    val keyBits = derNext(data, keyAlgorithm, spki.end)
+    if (keyOid.tag != 6 || keyBits.tag != 3) return bad
+    val oid = derOidText(data.slice(keyOid.begin, keyOid.end))
+    var n = ""
+    var e = ""
+    if (oid == PDF_OID_RSA && keyBits.end - keyBits.begin > 1) {
+        val key = data.slice(keyBits.begin + 1, keyBits.end)
+        val sequence = derAt(key, 0, key.size)
+        val ni = derInside(key, sequence)
+        val ei = derNext(key, ni, sequence.end)
+        if (sequence.tag == 0x30 && ni.tag == 2 && ei.tag == 2) {
+            n = stripZeros(key.slice(ni.begin, ni.end))
+            e = stripZeros(key.slice(ei.begin, ei.end))
+        }
+    }
+    PdfCertificate(
+        true, data.slice(serial.start, serial.end), data.slice(issuer.start, issuer.end),
+        data.slice(subject.start, subject.end), nameCommonName(data, subject),
+        data.slice(before.begin, before.end), data.slice(after.begin, after.end), oid, n, e
+    )
+}
+
+// --- Building the CMS structure ----------------------------------------------------
+
+private fun signedAttributes(contentDigest: string, certificate: string): array<string> {
+    val attributes: array<string> = []
+    attributes.append(derSeq([derOid("1.2.840.113549.1.9.3"), der(0x31, derOid("1.2.840.113549.1.7.1"))]))
+    attributes.append(derSeq([derOid("1.2.840.113549.1.9.4"), der(0x31, der(4, contentDigest))]))
+    // ESS signing-certificate-v2, which PAdES requires; SHA-256 is its default.
+    val certId = derSeq([der(4, sha256(certificate))])
+    attributes.append(derSeq([derOid("1.2.840.113549.1.9.16.2.47"), der(0x31, derSeq([derSeq([certId])]))]))
+    // DER orders a SET by its encoded members.
+    for (i in 1 until attributes.size) {
+        val value = attributes[i]
+        var j = i - 1
+        while (j >= 0 && attributes[j] > value) {
+            attributes[j + 1] = attributes[j]
+            j = j - 1
+        }
+        attributes[j + 1] = value
+    }
+    attributes
+}
+
+private fun buildCms(contentDigest: string, var signer: PdfSigner): string {
+    val chain = signer.certificates()
+    if (chain.size == 0) return ""
+    val certificate = pdfParseCertificate(chain[0])
+    if (!certificate.ok) return ""
+    val attributes = textJoin(signedAttributes(contentDigest, chain[0]))
+    val signature = signer.sign(der(0x31, attributes))
+    if (signature == "") return ""
+    val sha = derSeq([derOid(PDF_OID_SHA256), der(5, "")])
+    val algorithm = signer.algorithmOid()
+    val signatureAlgorithm = if (algorithm == PDF_OID_RSA_SHA256) derSeq([derOid(algorithm), der(5, "")]) else derSeq([derOid(algorithm)])
+    val signerInfo = derSeq([
+        der(2, "\x01"),
+        derSeq([certificate.issuerDer, certificate.serialDer]),
+        sha,
+        der(0xa0, attributes),
+        signatureAlgorithm,
+        der(4, signature)
+    ])
+    val signedData = derSeq([
+        der(2, "\x01"),
+        der(0x31, sha),
+        derSeq([derOid("1.2.840.113549.1.7.1")]),
+        der(0xa0, textJoin(chain)),
+        der(0x31, signerInfo)
+    ])
+    derSeq([derOid("1.2.840.113549.1.7.2"), der(0xa0, signedData)])
+}
+
+// --- Writing objects back ------------------------------------------------------------
+
+private fun PdfReader.writeValue(id: int, var out: ByteBuffer, depth: int): void {
+    if (depth > 64) {
+        out.appendText("null")
+        return
+    }
+    val kind = kinds[id]
+    when (kind) {
+        PDF_NULL -> out.appendText("null")
+        PDF_BOOL -> out.appendText(if (first[id] != 0) "true" else "false")
+        PDF_INT -> out.appendInt(first[id])
+        PDF_REAL -> out.appendText(pdfNumber(reals[first[id]], 6))
+        PDF_STRING -> {
+            out.appendText("<")
+            out.appendText(pdfHexEncode(texts[first[id]]))
+            out.appendText(">")
+        }
+        PDF_NAME -> out.appendText(pdfNameToken(texts[first[id]]))
+        PDF_REF -> out.appendText("${first[id]} ${second[id]} R")
+        PDF_ARRAY -> {
+            out.appendText("[")
+            for (i in 0 until second[id]) {
+                writeValue(children[first[id] + i], out, depth + 1)
+                out.appendText(" ")
+            }
+            out.appendText("]")
+        }
+        PDF_DICT -> writeDict(id, array<string>(), "", out, depth)
+        else -> out.appendText("null")
+    }
+    return
+}
+
+private fun PdfReader.writeDict(id: int, skipped: array<string>, extra: string, var out: ByteBuffer, depth: int): void {
+    out.appendText("<<")
+    for (i in 0 until second[id]) {
+        val key = texts[first[children[first[id] + i * 2]]]
+        var skip = false
+        for (s in skipped) if (s == key) skip = true
+        if (!skip) {
+            out.appendText(" ")
+            out.appendText(pdfNameToken(key))
+            out.appendText(" ")
+            writeValue(children[first[id] + i * 2 + 1], out, depth + 1)
+        }
+    }
+    out.appendText(extra)
+    out.appendText(" >>")
+    return
+}
+
+private fun PdfReader.objectNumberOf(dict: int): int {
+    for (number in objectCache.keys()) {
+        if ((objectCache.get(number) ?? -1) == dict) return number
+    }
+    -1
+}
+
+class PdfSignOptions(
+    // Milliseconds since 1970: the claimed signing time, /M in the signature.
+    val signedAt: int,
+    val name: string = "",
+    val reason: string = "",
+    val location: string = "",
+    val contactInfo: string = "",
+    val fieldName: string = "Signature1",
+    // Room for the CMS structure in the file, in bytes.
+    val reservedBytes: int = 16384
+)
+
+class PdfSignResult(val ok: bool, val error: string, val bytes: string)
+
+private fun signFailure(reason: string): PdfSignResult = PdfSignResult(false, reason, "")
+
+private fun infoDate(ms: int): string {
+    val d = utcDate(ms)
+    val two = { v: int -> "$v".padStart(2, "0") }
+    "D:${d.year}${two(d.month)}${two(d.day)}${two(d.hour)}${two(d.minute)}${two(d.second)}Z"
+}
+
+// Adds a PAdES B-B signature to `file` as an incremental update, so everything
+// signed before stays as it was. The signature field is invisible.
+fun pdfSign(file: string, var signer: PdfSigner, options: PdfSignOptions): PdfSignResult {
+    val reader = pdfOpen(file)
+    if (!reader.ok) return signFailure("can't read the document: ${reader.error}")
+    if (reader.encrypted) return signFailure("signing encrypted documents is not supported")
+    if (reader.repaired) return signFailure("the document is damaged; rewrite it before signing")
+    val rootReference = reader.get(reader.trailer, "Root")
+    if (reader.kinds[rootReference] != PDF_REF) return signFailure("the catalog is not an indirect object")
+    val rootNumber = reader.first[rootReference]
+    val previous = reader.findStartXref()
+    if (previous < 0) return signFailure("no startxref")
+    val pageDict = reader.pages[0].dict
+    val pageNumber = reader.objectNumberOf(pageDict)
+    if (pageNumber < 0) return signFailure("the first page is not an indirect object")
+
+    var size = reader.intOf(reader.get(reader.trailer, "Size"), 0)
+    for (n in reader.xrefOffset.keys()) if (n >= size) size = n + 1
+    for (n in reader.xrefStream.keys()) if (n >= size) size = n + 1
+    val signatureNumber = size
+    val widgetNumber = size + 1
+    val xrefStreamNumber = size + 2
+
+    // Field and page updates.
+    val formReference = reader.get(reader.root, "AcroForm")
+    val form = reader.dictOf(formReference)
+    val fieldList = byteBuffer()
+    fieldList.appendText("/Fields [")
+    val fields = reader.getResolved(form, "Fields")
+    for (i in 0 until reader.arraySize(fields)) {
+        val existing = reader.arrayAt(fields, i)
+        reader.writeValue(existing, fieldList, 0)
+        fieldList.appendText(" ")
+    }
+    fieldList.appendText("$widgetNumber 0 R] /SigFlags 3")
+    val formText = byteBuffer()
+    if (form != 0) reader.writeDict(form, ["Fields", "SigFlags"], " " + fieldList.toText(), formText, 0)
+    else formText.appendText("<< ${fieldList.toText()} >>")
+
+    val updates: array<int> = []
+    val bodies: array<string> = []
+    if (reader.kinds[formReference] == PDF_REF) {
+        updates.append(reader.first[formReference])
+        bodies.append(formText.toText())
+    }
+    val catalog = byteBuffer()
+    if (reader.kinds[formReference] == PDF_REF) reader.writeDict(reader.root, array<string>(), "", catalog, 0)
+    else reader.writeDict(reader.root, ["AcroForm"], " /AcroForm ${formText.toText()}", catalog, 0)
+    updates.append(rootNumber)
+    bodies.append(catalog.toText())
+
+    val annots = byteBuffer()
+    annots.appendText(" /Annots [")
+    val existingAnnots = reader.getResolved(pageDict, "Annots")
+    for (i in 0 until reader.arraySize(existingAnnots)) {
+        reader.writeValue(reader.arrayAt(existingAnnots, i), annots, 0)
+        annots.appendText(" ")
+    }
+    annots.appendText("$widgetNumber 0 R]")
+    val page = byteBuffer()
+    reader.writeDict(pageDict, ["Annots"], annots.toText(), page, 0)
+    updates.append(pageNumber)
+    bodies.append(page.toText())
+
+    updates.append(widgetNumber)
+    bodies.append(
+        "<< /Type /Annot /Subtype /Widget /FT /Sig /Rect [0 0 0 0] /F 132 /T ${pdfTextStringToken(options.fieldName)} " +
+            "/V $signatureNumber 0 R /P $pageNumber 0 R >>"
+    )
+
+    // The signature object, with room left for its offsets and contents.
+    val rangeRoom = "[0 ${" ".repeat(10)} ${" ".repeat(10)} ${" ".repeat(10)}]"
+    val hexRoom = options.reservedBytes * 2
+    val signature = byteBuffer()
+    signature.appendText("<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /ETSI.CAdES.detached /ByteRange $rangeRoom /Contents <")
+    val contentsAt = signature.size()
+    signature.appendText("0".repeat(hexRoom))
+    signature.appendText(">")
+    signature.appendText(" /M (${infoDate(options.signedAt)})")
+    if (options.name != "") signature.appendText(" /Name ${pdfTextStringToken(options.name)}")
+    if (options.reason != "") signature.appendText(" /Reason ${pdfTextStringToken(options.reason)}")
+    if (options.location != "") signature.appendText(" /Location ${pdfTextStringToken(options.location)}")
+    if (options.contactInfo != "") signature.appendText(" /ContactInfo ${pdfTextStringToken(options.contactInfo)}")
+    signature.appendText(" >>")
+
+    val out = byteBuffer()
+    out.appendText(file)
+    if (file.size > 0 && file[file.size - 1] != 10) out.appendText("\n")
+    val offsets = Map<int, int>()
+    for (i in 0 until updates.size) {
+        offsets.set(updates[i], out.size())
+        out.appendText("${updates[i]} 0 obj\n${bodies[i]}\nendobj\n")
+    }
+    offsets.set(signatureNumber, out.size())
+    out.appendText("$signatureNumber 0 obj\n")
+    val signatureAt = out.size()
+    out.appendText(signature.toText())
+    out.appendText("\nendobj\n")
+
+    // The cross-reference section, the same kind as the one before it.
+    val idText = byteBuffer()
+    val id = reader.get(reader.trailer, "ID")
+    if (id != 0) {
+        idText.appendText(" /ID ")
+        reader.writeValue(reader.resolve(id), idText, 0)
+    }
+    val info = reader.get(reader.trailer, "Info")
+    val infoText = byteBuffer()
+    if (info != 0) {
+        infoText.appendText(" /Info ")
+        reader.writeValue(info, infoText, 0)
+    }
+    val tail = "/Root $rootNumber 0 R${infoText.toText()}${idText.toText()} /Prev $previous"
+    val classic = pdfStartsWithAt(file, previous, "xref")
+    val sorted: array<int> = []
+    for (n in offsets.keys()) sorted.append(n)
+    if (!classic) sorted.append(xrefStreamNumber)
+    for (i in 1 until sorted.size) {
+        val v = sorted[i]
+        var j = i - 1
+        while (j >= 0 && sorted[j] > v) {
+            sorted[j + 1] = sorted[j]
+            j = j - 1
+        }
+        sorted[j + 1] = v
+    }
+    val xrefAt = out.size()
+    if (classic) {
+        out.appendText("xref\n")
+        for (n in sorted) {
+            out.appendText("$n 1\n${"${offsets.get(n) ?? 0}".padStart(10, "0")} 00000 n \n")
+        }
+        out.appendText("trailer\n<< /Size ${signatureNumber + 2} $tail >>\nstartxref\n$xrefAt\n%%EOF\n")
+    } else {
+        offsets.set(xrefStreamNumber, xrefAt)
+        val rows = byteBuffer()
+        val index = byteBuffer()
+        for (n in sorted) {
+            index.appendText("$n 1 ")
+            rows.appendByteValue(1)
+            rows.pdfAppendU32(offsets.get(n) ?? 0)
+            rows.pdfAppendU16(0)
+        }
+        out.appendText("$xrefStreamNumber 0 obj\n<< /Type /XRef /Size ${xrefStreamNumber + 1} /W [1 4 2] /Index [${index.toText()}] $tail /Length ${rows.size()} >>\nstream\n")
+        out.appendBuffer(rows)
+        out.appendText("\nendstream\nendobj\nstartxref\n$xrefAt\n%%EOF\n")
+    }
+
+    // Offsets are known now: fill in the range, hash around the contents, sign.
+    val whole = out.toText()
+    val hexBegin = signatureAt + contentsAt
+    val hexEnd = hexBegin + hexRoom
+    val gapBegin = hexBegin - 1
+    val gapEnd = hexEnd + 1
+    val rangeAt = whole.indexOf("/ByteRange [", signatureAt) + 12
+    val rangeText = "0 $gapBegin $gapEnd ${whole.size - gapEnd}]"
+    if (rangeText.size > rangeRoom.size - 1) return signFailure("byte range doesn't fit")
+    val withRange = whole.slice(0, rangeAt) + rangeText + " ".repeat(rangeRoom.size - 1 - rangeText.size) + whole.slice(rangeAt + rangeRoom.size - 1, whole.size)
+    val signedBytes = withRange.slice(0, gapBegin) + withRange.slice(gapEnd, withRange.size)
+    val cms = buildCms(sha256(signedBytes), signer)
+    if (cms == "") return signFailure("the signer produced no signature")
+    if (cms.size > options.reservedBytes) return signFailure("the signature needs ${cms.size} bytes; raise reservedBytes")
+    val hex = pdfHexEncode(cms)
+    PdfSignResult(true, "", withRange.slice(0, hexBegin) + hex + withRange.slice(hexBegin + hex.size, withRange.size))
+}
+
+// --- Verifying ---------------------------------------------------------------------
+
+class PdfSignatureInfo(
+    val fieldName: string,
+    val subFilter: string,
+    val signerName: string,
+    val signedAt: string,
+    val reason: string,
+    // The byte ranges hash to what the signature says and leave out only its value.
+    val digestValid: bool,
+    // The signature checks out against the certificate inside it. Nothing here
+    // says that certificate is trustworthy: no chain, revocation or trust list.
+    val signatureValid: bool,
+    // Nothing follows the signed bytes; false means later incremental updates.
+    val coversWholeFile: bool,
+    val certificate: PdfCertificate,
+    val problem: string
+)
+
+private fun digestByOid(oid: string, data: string): string {
+    if (oid == PDF_OID_SHA256) return sha256(data)
+    if (oid == PDF_OID_SHA384) return pdfSha384(data)
+    if (oid == PDF_OID_SHA512) return pdfSha512(data)
+    ""
+}
+
+private fun signatureFailure(field: string, sub: string, name: string, at: string, reason: string, whole: bool, digest: bool, cert: PdfCertificate, problem: string): PdfSignatureInfo =
+    PdfSignatureInfo(field, sub, name, at, reason, digest, false, whole, cert, problem)
+
+private fun PdfReader.collectSignatures(reference: int, parentName: string, depth: int, var seen: Map<int, int>, var names: array<string>, var values: array<int>): void {
+    if (depth > options.maxDepth || values.size > 4096) return
+    val dict = resolve(reference)
+    if (dictOf(dict) == 0 || seen.has(dict)) return
+    seen.set(dict, 1)
+    val partial = pdfDecodeTextString(stringOf(get(dict, "T")))
+    val name = if (partial == "") parentName else if (parentName == "") partial else "$parentName.$partial"
+    val value = getResolved(dict, "V")
+    if (nameOf(get(dict, "FT")) == "Sig" && dictOf(value) != 0) {
+        names.append(name)
+        values.append(value)
+    }
+    val kids = getResolved(dict, "Kids")
+    for (i in 0 until arraySize(kids)) collectSignatures(arrayAt(kids, i), name, depth + 1, seen, names, values)
+    return
+}
+
+private fun PdfReader.verifyOne(file: string, field: string, value: int): PdfSignatureInfo {
+    val noCert = PdfCertificate(false, "", "", "", "", "", "", "", "", "")
+    val sub = nameOf(get(value, "SubFilter"))
+    val name = pdfDecodeTextString(stringOf(get(value, "Name")))
+    val at = stringOf(get(value, "M"))
+    val reason = pdfDecodeTextString(stringOf(get(value, "Reason")))
+    val fail = { whole: bool, digest: bool, cert: PdfCertificate, problem: string ->
+        signatureFailure(field, sub, name, at, reason, whole, digest, cert, problem)
+    }
+    if (sub != "ETSI.CAdES.detached" && sub != "adbe.pkcs7.detached") return fail(false, false, noCert, "unsupported signature type $sub")
+    val range = getResolved(value, "ByteRange")
+    if (arraySize(range) != 4) return fail(false, false, noCert, "no byte range")
+    val a0 = intOf(arrayAt(range, 0), -1)
+    val a1 = intOf(arrayAt(range, 1), -1)
+    val b0 = intOf(arrayAt(range, 2), -1)
+    val b1 = intOf(arrayAt(range, 3), -1)
+    if (a0 != 0 || a1 < 0 || b0 < a1 || b1 < 0 || b0 + b1 > file.size) return fail(false, false, noCert, "invalid byte range")
+    // What the range leaves out must be exactly the hexadecimal /Contents string.
+    if (b0 - a1 < 2 || file[a1] != 60 || file[b0 - 1] != 62) return fail(false, false, noCert, "byte range doesn't exclude the contents")
+    val gap = file.slice(a1 + 1, b0 - 1)
+    for (c in gap) {
+        if (pdfHexDigit(c) < 0) return fail(false, false, noCert, "byte range doesn't exclude only the contents")
+    }
+    var whole = b0 + b1 == file.size
+    if (!whole) {
+        // A file may end in up to a line ending past the signed bytes.
+        val rest = file.slice(b0 + b1, file.size)
+        whole = rest == "\n" || rest == "\r\n" || rest == "\r"
+    }
+    val signedBytes = file.slice(0, a1) + file.slice(b0, b0 + b1)
+    val cms = pdfHexDecode(gap)
+    // ContentInfo, SignedData.
+    val info = derAt(cms, 0, cms.size)
+    val typeOid = derInside(cms, info)
+    val wrapped = derNext(cms, typeOid, info.end)
+    if (info.tag != 0x30 || typeOid.tag != 6 || wrapped.tag != 0xa0) return fail(whole, false, noCert, "malformed CMS")
+    val signedData = derInside(cms, wrapped)
+    if (signedData.tag != 0x30) return fail(whole, false, noCert, "malformed CMS")
+    val version = derInside(cms, signedData)
+    val algorithms = derNext(cms, version, signedData.end)
+    val encapsulated = derNext(cms, algorithms, signedData.end)
+    var next = derNext(cms, encapsulated, signedData.end)
+    if (version.tag != 2 || algorithms.tag != 0x31 || encapsulated.tag != 0x30) return fail(whole, false, noCert, "malformed SignedData")
+    val certificates: array<string> = []
+    if (next.tag == 0xa0) {
+        var c = derInside(cms, next)
+        var count = 0
+        while (c.ok() && count < 64) {
+            certificates.append(cms.slice(c.start, c.end))
+            c = derAt(cms, c.end, next.end)
+            count = count + 1
+        }
+        next = derNext(cms, next, signedData.end)
+    }
+    if (next.tag == 0xa1) next = derNext(cms, next, signedData.end)
+    if (next.tag != 0x31) return fail(whole, false, noCert, "no signer information")
+    val signerInfo = derInside(cms, next)
+    if (signerInfo.tag != 0x30) return fail(whole, false, noCert, "no signer information")
+    val siVersion = derInside(cms, signerInfo)
+    val identifier = derNext(cms, siVersion, signerInfo.end)
+    val digestAlgorithm = derNext(cms, identifier, signerInfo.end)
+    var cursor = derNext(cms, digestAlgorithm, signerInfo.end)
+    if (siVersion.tag != 2 || digestAlgorithm.tag != 0x30) return fail(whole, false, noCert, "malformed signer information")
+    val digestOidItem = derInside(cms, digestAlgorithm)
+    val digestOid = derOidText(cms.slice(digestOidItem.begin, digestOidItem.end))
+    val contentDigest = digestByOid(digestOid, signedBytes)
+    if (contentDigest == "") return fail(whole, false, noCert, "unsupported digest $digestOid")
+
+    // Find the signer's certificate by issuer and serial.
+    var certificate = noCert
+    if (identifier.tag == 0x30) {
+        val wantedIssuer = derInside(cms, identifier)
+        val wantedSerial = derNext(cms, wantedIssuer, identifier.end)
+        if (wantedIssuer.ok() && wantedSerial.ok()) {
+            val issuerBytes = cms.slice(wantedIssuer.start, wantedIssuer.end)
+            val serialBytes = cms.slice(wantedSerial.start, wantedSerial.end)
+            for (candidate in certificates) {
+                val parsed = pdfParseCertificate(candidate)
+                if (parsed.ok && parsed.issuerDer == issuerBytes && parsed.serialDer == serialBytes) certificate = parsed
+            }
+        }
+    }
+    if (!certificate.ok) return fail(whole, false, noCert, "the signer's certificate is not in the signature")
+
+    var signedPayload = contentDigest
+    var hasAttributes = false
+    var payloadDigestOk = false
+    if (cursor.tag == 0xa0) {
+        hasAttributes = true
+        var attribute = derInside(cms, cursor)
+        var seen = 0
+        while (attribute.ok() && attribute.tag == 0x30 && seen < 64) {
+            val oid = derInside(cms, attribute)
+            val set = derNext(cms, oid, attribute.end)
+            if (oid.tag == 6 && set.tag == 0x31 && derOidText(cms.slice(oid.begin, oid.end)) == "1.2.840.113549.1.9.4") {
+                val digestValue = derInside(cms, set)
+                if (digestValue.tag == 4 && cms.slice(digestValue.begin, digestValue.end) == contentDigest) payloadDigestOk = true
+            }
+            attribute = derAt(cms, attribute.end, cursor.end)
+            seen = seen + 1
+        }
+        // The signature covers the attributes as a SET, not with their [0] tag.
+        signedPayload = der(0x31, cms.slice(cursor.begin, cursor.end))
+        cursor = derNext(cms, cursor, signerInfo.end)
+    } else payloadDigestOk = true
+    if (!payloadDigestOk) return fail(whole, false, certificate, "the document was changed: digest mismatch")
+    val signatureAlgorithm = cursor
+    val signatureValue = derNext(cms, signatureAlgorithm, signerInfo.end)
+    if (signatureAlgorithm.tag != 0x30 || signatureValue.tag != 4) return fail(whole, true, certificate, "no signature value")
+    val algorithmItem = derInside(cms, signatureAlgorithm)
+    val algorithm = derOidText(cms.slice(algorithmItem.begin, algorithmItem.end))
+    var hashOid = ""
+    if (algorithm == PDF_OID_RSA_SHA256) hashOid = PDF_OID_SHA256
+    else if (algorithm == PDF_OID_RSA_SHA384) hashOid = PDF_OID_SHA384
+    else if (algorithm == PDF_OID_RSA_SHA512) hashOid = PDF_OID_SHA512
+    else if (algorithm == PDF_OID_RSA) hashOid = digestOid
+    if (hashOid == "" || certificate.rsaModulus == "") return fail(whole, true, certificate, "unsupported signature algorithm $algorithm")
+    val payloadHash = digestByOid(hashOid, if (hasAttributes) signedPayload else signedBytes)
+    val expected = pkcs1Encode(hashOid, payloadHash, certificate.rsaModulus.size)
+    val recovered = modPow(cms.slice(signatureValue.begin, signatureValue.end), certificate.rsaExponent, certificate.rsaModulus)
+    if (expected == "" || recovered != expected) return fail(whole, true, certificate, "the signature doesn't match the certificate")
+    PdfSignatureInfo(field, sub, name, at, reason, true, true, whole, certificate, "")
+}
+
+// Checks every signature of a document. See PdfSignatureInfo for what passing means.
+fun pdfVerifySignatures(file: string): array<PdfSignatureInfo> {
+    val out: array<PdfSignatureInfo> = []
+    val reader = pdfOpen(file)
+    if (!reader.ok || reader.encrypted) return out
+    val fields = reader.getResolved(reader.getResolved(reader.root, "AcroForm"), "Fields")
+    val seen = Map<int, int>()
+    val names: array<string> = []
+    val values: array<int> = []
+    for (i in 0 until reader.arraySize(fields)) {
+        reader.collectSignatures(reader.arrayAt(fields, i), "", 0, seen, names, values)
+    }
+    for (i in 0 until names.size) out.append(reader.verifyOne(file, names[i], values[i]))
+    out
+}

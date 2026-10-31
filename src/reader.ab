@@ -31,7 +31,7 @@ class PdfReadOptions(
     // The most bytes all decoding of this document may produce.
     val maxTotalBytes: int = 1073741824,
     // The most parsed values held at once.
-    val maxNodes: int = 8000000,
+    val maxNodes: int = 3000000,
     val maxDepth: int = 48,
     val maxPages: int = 200000,
     // The most content stream operators one page may run, forms included.
@@ -107,11 +107,15 @@ class PdfReader(
     var root: int = 0,
     var repaired: bool = false,
     var decodedTotal: int = 0,
-    var arenaGrew: bool = false,
+    // Counts objects cached: anything above a release mark must stay if this moved.
+    var arenaEpoch: int = 0,
     var limitHit: bool = false,
     var loadDepth: int = 0,
     var scanned: int = 0,
     var xrefEntries: int = 0,
+    // Object stream bytes held, and CMap entries read, over the whole document.
+    var objectStreamBytes: int = 0,
+    var cmapBudget: int = 2000000,
     // Encryption state.
     var encrypted: bool = false,
     var needsPassword: bool = false,
@@ -571,7 +575,7 @@ class PdfReader(
         loadDepth = loadDepth - 1
         objectBusy.remove(number)
         objectCache.set(number, id)
-        arenaGrew = true
+        arenaEpoch = arenaEpoch + 1
         id
     }
 
@@ -707,6 +711,11 @@ class PdfReader(
             offsets.append(first[v])
             release(mark, reals.size, texts.size, children.size)
             i = i + 1
+        }
+        objectStreamBytes = objectStreamBytes + content.size
+        if (objectStreamBytes > 134217728) {
+            warn("object streams too large to hold; some objects are not read")
+            return false
         }
         objectStreamData.set(stream, content)
         objectStreamFirst.set(stream, firstAt)
@@ -957,6 +966,7 @@ class PdfReader(
         objectStreamData.clear()
         objectStreamFirst.clear()
         objectStreamOffsets.clear()
+        objectStreamBytes = 0
         trailer = 0
         val numbers: array<int> = []
         var at = data.indexOf("obj")
@@ -1015,12 +1025,10 @@ class PdfReader(
             val savedMethod = stringMethod
             stringMethod = 0
             var keep = false
-            arenaGrew = false
+            val epoch = arenaEpoch
             val id = parseIndirectAt(offset, number)
             stringMethod = savedMethod
-            // A /Length reference cached an object above the mark: leave it all.
-            if (arenaGrew) keep = true
-            if (id > 0) {
+            if (id > 0 && (kinds[id] == PDF_DICT || kinds[id] == PDF_STREAM)) {
                 if (isTypeName(id, "ObjStm")) objectStreams.append(number)
                 else if (isTypeName(id, "XRef")) {
                     if (trailer == 0 && hasKey(id, "Root")) {
@@ -1029,7 +1037,9 @@ class PdfReader(
                     }
                 } else if (isTypeName(id, "Catalog")) catalog = number
             }
-            if (!keep) {
+            // An object loaded meanwhile, such as a /Length reference, was cached
+            // above the mark: then everything stays.
+            if (!keep && arenaEpoch == epoch) {
                 release(mark, markReals, markTexts, markChildren)
             }
         }
@@ -1299,6 +1309,7 @@ class PdfReader(
         objectStreamData.clear()
         objectStreamFirst.clear()
         objectStreamOffsets.clear()
+        objectStreamBytes = 0
         if (repaired) {
             for (number in xrefOffset.keys()) {
                 val offset = xrefOffset.get(number) ?? -1

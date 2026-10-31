@@ -67,16 +67,38 @@ says the cross-references had to be rebuilt by scanning.
   and 6), with the user or owner password. Public-key handlers are refused.
 - `formFields()` and `pageAnnotations(i)`.
 
-Hostile input: nothing in the reader panics on any input, by design and tested by
-fuzzing. Recursion, decoded bytes, parsed values, pages and operators all have limits in
-`PdfReadOptions`; past a limit a read ends with less data and a warning. That includes
-the 1 GiB default heap limit of an Abla program only if you keep the defaults or lower
-them: raising `maxStreamBytes` far past it can reach that panic.
+Hostile input: the reader is built not to panic on any input, and fuzzing tests that.
+Recursion, decoded bytes, parsed values, pages and operators all have limits in
+`PdfReadOptions`; past a limit a read ends with less data and a warning. The defaults fit
+Abla's default 1 GiB heap limit. Raising `maxStreamBytes` or `maxNodes` a lot can reach
+that limit's panic unless you also raise it with `memorySetLimit`.
+
+## Signing (PAdES B-B)
+
+`pdfSign(file, signer, PdfSignOptions(signedAt = ms, reason = ...))` appends an incremental
+update holding an invisible signature field and a CMS detached `ETSI.CAdES.detached`
+signature with SHA-256 and the signing-certificate-v2 attribute. `PdfSigner` is an
+interface, so the key can stay in a smart card or HSM; `PdfRsaSigner` signs with an RSA key
+in memory and is for tests and development, since it isn't hardened against timing.
+
+`pdfVerifySignatures(file)` reports for each signature whether the byte ranges and digest
+hold, whether the RSA signature matches the certificate inside it, and whether the signed
+bytes reach the end of the file.
+
+**This is not a qualified signature, and a passing check isn't a legal judgement.** A
+qualified electronic signature needs a qualified certificate and signature device, which
+this library doesn't provide; it has only been tested with self-generated certificates.
+The verifier doesn't build a chain to a trust anchor, check revocation or consult the EU
+Trusted List. Not implemented: timestamps and long-term validation (B-T, B-LT, B-LTA),
+visible signature appearances, signing encrypted files, verifying ECDSA signatures.
 
 ## Testing
 
 `make test` runs the unit tests. `make external` puts generated files through qpdf,
 poppler, ghostscript and veraPDF (PDF/A-2b). `make corpus` generates PDFs with cairo,
 reportlab, ghostscript, qpdf, pypdf and poppler, plus hand-written damaged and hostile
-ones, compares the reader with poppler and pypdf on them, then fuzzes. All through nix.
-`tests/fuzz_test.ab` takes a first seed, a seed count and a directory for longer runs.
+ones, compares the reader with poppler and pypdf on them, then fuzzes. `make signatures`
+signs with a throwaway certificate and checks with pdfsig, openssl cms, qpdf and pyHanko.
+All through nix. `tests/fuzz_test.ab` takes a first seed, a seed count and a directory for
+longer runs, leaving the input of a crash in `build/fuzz-last.pdf`, and `tools/read-file.ab`
+reads one file completely to reproduce it.

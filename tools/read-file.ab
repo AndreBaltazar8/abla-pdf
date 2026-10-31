@@ -1,0 +1,22 @@
+// Reads everything in a PDF and prints a summary, to reproduce a fuzz failure:
+//   read-file file.pdf [password]
+import "abla/fs"
+import "abla/io"
+import "abla/process"
+import "../src/pdf.ab"
+
+fun main: int {
+    val password = if (processArgumentCount() > 1) processArgument(1) else ""
+    val doc = pdfOpen(path(processArgument(0)).readText(), PdfReadOptions(password = password))
+    println("ok ${doc.ok} pages ${doc.pageCount()} repaired ${doc.repaired} error ${doc.error}")
+    for (w in doc.warnings) println("warning: $w")
+    if (!doc.ok) return 1
+    println("title: ${doc.metadata().title}")
+    println("fields: ${doc.formFields().size}")
+    for (i in 0 until doc.pageCount()) {
+        print(doc.pageText(i, true))
+        for (image in doc.pageImages(i)) println("image ${image.width}x${image.height} ${doc.imageData(image).encoding}")
+        println("annotations: ${doc.pageAnnotations(i).size}")
+    }
+    0
+}

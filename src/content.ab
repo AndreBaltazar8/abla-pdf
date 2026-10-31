@@ -176,7 +176,8 @@ fun PdfReader.pdfParseCMap(
     val markChildren = children.size
     val lx = PdfLexer(content, 0)
     val stack: array<int> = []
-    var budget = 300000
+    var budget = if (cmapBudget < 300000) cmapBudget else 300000
+    val budgetAtStart = budget
     var running = true
     while (running && budget > 0) {
         val v = parseValue(lx, false, 0)
@@ -261,6 +262,7 @@ fun PdfReader.pdfParseCMap(
             if (word == "stream" || word == "endcmap") running = false
         }
     }
+    cmapBudget = cmapBudget - (budgetAtStart - budget)
     release(markNodes, markReals, markTexts, markChildren)
     currentNumber = savedNumber
     return
@@ -332,9 +334,10 @@ private fun standardWidthsFor(plain: string): array<int>? {
 private fun PdfReader.embeddedCidUnicode(descendant: int): Map<int, int> {
     val out = Map<int, int>()
     val program = getResolved(getResolved(descendant, "FontDescriptor"), "FontFile2")
-    if (kinds[program] != PDF_STREAM) return out
+    if (kinds[program] != PDF_STREAM || cmapBudget <= 0) return out
     val parsed = pdfParseTrueType(decodeStream(program))
     if (!parsed.ok) return out
+    cmapBudget = cmapBudget - parsed.cmap.size
     val gidToCid = Map<int, int>()
     val mapping = getResolved(descendant, "CIDToGIDMap")
     var direct = true
@@ -676,7 +679,7 @@ private fun PdfReader.pdfRunContent(content: string, resources: int, var st: Int
         val markReals = reals.size
         val markTexts = texts.size
         val markChildren = children.size
-        arenaGrew = false
+        val epoch = arenaEpoch
         operands.clear()
         var word = ""
         while (word == "" && running) {
@@ -695,7 +698,10 @@ private fun PdfReader.pdfRunContent(content: string, resources: int, var st: Int
                 running = false
             } else runOperator(word, operands, resources, lx, st, depth)
         }
-        if (!arenaGrew) release(markNodes, markReals, markTexts, markChildren)
+        if (arenaEpoch == epoch) {
+            release(markNodes, markReals, markTexts, markChildren)
+            limitHit = false
+        }
     }
     currentNumber = savedNumber
     return

@@ -1,0 +1,27 @@
+// Signs a PDF with a key and certificate in PEM or DER, for tools/test-signatures.sh:
+//   sign-file in.pdf key cert out.pdf
+import "abla/fs"
+import "abla/io"
+import "abla/process"
+import "abla/text"
+import "../src/pdf.ab"
+
+fun derOf(text: string): string = if (text.contains("-----BEGIN")) pdfPemToDer(text) else text
+
+fun main: int {
+    val key = pdfParseRsaPrivateKey(derOf(path(processArgument(1)).readText()))
+    if (!key.ok) {
+        eprintln("bad key")
+        return 2
+    }
+    val signer = PdfRsaSigner(key.modulus, key.exponent, [derOf(path(processArgument(2)).readText())])
+    val result = pdfSign(path(processArgument(0)).readText(), signer, PdfSignOptions(
+        1767225600000, name = "Assinatura de Teste", reason = "Teste de integração", location = "Évora"
+    ))
+    if (!result.ok) {
+        eprintln(result.error)
+        return 3
+    }
+    if (!path(processArgument(3)).writeText(result.bytes)) return 4
+    0
+}

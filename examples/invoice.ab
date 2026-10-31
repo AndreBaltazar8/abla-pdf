@@ -5,8 +5,8 @@ import "abla/process"
 import "../src/pdf.ab"
 
 fun main: int {
-    val fontPath = processArgument(1)
-    val outPath = processArgument(2)
+    val fontPath = processArgument(0)
+    val outPath = processArgument(1)
     val doc = PdfDocument(title = "Fatura FT 2026/1", author = "Associação Exemplo", subject = "Exemplo de faturação")
     val font = doc.embedFont(path(fontPath).readText())
     if (!font.ok) return 1

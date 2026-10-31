@@ -22,6 +22,10 @@ jobs:
         run: make test-in-shell COMPILER=ablac
       - name: Generated files through qpdf, poppler, ghostscript and veraPDF
         run: nix-shell -p qpdf poppler-utils verapdf ghostscript --run tools/check-generated.sh
+      - name: Signatures through pdfsig, openssl and pyHanko
+        run: |
+          ablac build tools/sign-file.ab -o build/sign-file
+          nix-shell -p openssl qpdf poppler-utils 'python3.withPackages(p: [p.pyhanko p.pyhanko-certvalidator])' --run tools/test-signatures.sh
       - name: Corpus from other producers
         run: tools/test-corpus.sh
       - name: Reader over the corpus, and fuzzing

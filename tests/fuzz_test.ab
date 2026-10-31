@@ -99,10 +99,10 @@ fun sampleFile(compress: bool, objectStreams: bool): string {
 }
 
 fun main: int {
-    val firstSeed = if (processArgumentCount() > 1) f64SeedArg(processArgument(1)) else 1
-    val seeds = if (processArgumentCount() > 2) f64SeedArg(processArgument(2)) else 1500
+    val firstSeed = if (processArgumentCount() > 0) seedArg(processArgument(0)) else 1
+    val seeds = if (processArgumentCount() > 1) seedArg(processArgument(1)) else 1500
     val inputs = [sampleFile(true, false), sampleFile(false, false), sampleFile(true, true), sampleFile(false, true)]
-    val corpus = path(if (processArgumentCount() > 3) processArgument(3) else "tests/corpus/generated")
+    val corpus = path(if (processArgumentCount() > 2) processArgument(2) else "tests/corpus/generated")
     if (corpus.exists()) {
         for (entry in corpus.entries()) {
             val small = entry.info().size < 200000
@@ -119,7 +119,7 @@ fun main: int {
         val input = inputs[rng.next(inputs.size)]
         val damaged = mutate(input, rng)
         // The input that killed a run stays behind to reproduce it.
-        if (processArgumentCount() > 1) {
+        if (processArgumentCount() > 0) {
             progress.writeText("$seed\n")
             path("build/fuzz-last.pdf").writeText(damaged)
         }
@@ -130,7 +130,7 @@ fun main: int {
     testsPassed()
 }
 
-fun f64SeedArg(text: string): int {
+fun seedArg(text: string): int {
     var v = 0
     for (b in text) v = v * 10 + (b - 48)
     v

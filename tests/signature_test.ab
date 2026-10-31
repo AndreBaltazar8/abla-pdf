@@ -1,0 +1,69 @@
+// tests/fixtures/signed-sample.pdf was signed by tools/sign-file.ab with a key made
+// on the spot and thrown away, under a self-signed certificate: not a qualified
+// signature. tools/test-signatures.sh runs the signing side with independent
+// verifiers. Here: our verifier on that file, damaged and whole.
+
+import "abla/test"
+import "abla/fs"
+import "abla/bytes"
+import "abla/crypto"
+import "../src/pdf.ab"
+
+// No private key belongs in this repository, so a stub proves the failure paths.
+class NoCertificates : PdfSigner {
+    fun certificates(): array<string> = array<string>()
+    fun algorithmOid(): string = PDF_OID_RSA_SHA256
+    fun sign(message: string): string = "x"
+}
+
+fun main: int {
+    val file = path("tests/fixtures/signed-sample.pdf").readText()
+    val checks = pdfVerifySignatures(file)
+    expectEqual(checks.size, 1, "one signature")
+    val found = checks[0]
+    expect(found.problem == "", "no problem: ${found.problem}")
+    expect(found.digestValid, "digest")
+    expect(found.signatureValid, "signature")
+    expect(found.coversWholeFile, "whole file")
+    expectEqual(found.fieldName, "Signature1", "field")
+    expectEqual(found.subFilter, "ETSI.CAdES.detached", "type")
+    expect(found.certificate.commonName.contains("TEST ONLY"), "certificate name")
+    expectEqual(found.reason, "Teste de integração", "reason")
+    expectEqual(pdfParseDate(found.signedAt) ?? -1, 1767225600000, "time")
+
+    // Any change to signed bytes fails, wherever it is.
+    val at = file.indexOf("/ByteRange")
+    for (position in [20, 500, 3000, at - 50, file.size - 30]) {
+        val b = byteBuffer()
+        b.appendByteValue((file[position] + 1) & 255)
+        val changed = file.slice(0, position) + b.toText() + file.slice(position + 1, file.size)
+        val r = pdfVerifySignatures(changed)
+        var bad = true
+        for (one in r) if (one.digestValid && one.signatureValid) bad = false
+        expect(bad, "change at $position detected")
+    }
+    // A later update isn't covered, and says so; the signature itself stays valid.
+    val appended = pdfVerifySignatures(file + "% appended\n")
+    expectEqual(appended.size, 1, "still one")
+    expect(appended[0].signatureValid && !appended[0].coversWholeFile, "appended bytes reported")
+
+    // Damage in the CMS or the structure never panics.
+    var seed = 12345
+    for (i in 0 until 400) {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff
+        val position = seed % file.size
+        val b = byteBuffer()
+        b.appendByteValue(seed & 255)
+        pdfVerifySignatures(file.slice(0, position) + b.toText() + file.slice(position + 1, file.size))
+    }
+    expect(!pdfParseCertificate("junk").ok, "bad certificate")
+    expect(!pdfParseRsaPrivateKey("junk").ok, "bad key")
+    expectEqual(pdfPemToDer("no pem here"), "", "bad pem")
+
+    val doc = PdfDocument()
+    doc.addPage(PdfPage())
+    val failed = pdfSign(doc.toBytes(), NoCertificates(), PdfSignOptions(0))
+    expect(!failed.ok && failed.error != "", "signer without certificates fails")
+    expect(!pdfSign("junk", NoCertificates(), PdfSignOptions(0)).ok, "junk input fails")
+    testsPassed()
+}

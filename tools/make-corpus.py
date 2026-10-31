@@ -294,6 +294,32 @@ def hand_files():
         lengthchain.append(b"<< /Length %d 0 R >>\nstream\nx\nendstream" % (i + 1))
     write("hostile-length-chain", assemble(lengthchain))
 
+    # Values by the million, in an array and between content operators.
+    many = b"0 " * 12000000
+    write("hostile-many-values", assemble(simple_doc(stream(many + b" BT ET")) + [b"[" + many + b"]"]))
+    # Forms that each draw the next many times: far more operators than bytes.
+    fans = [b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /XObject << /X 5 0 R >> >> >>",
+            stream(b"/X Do " * 50)]
+    for i in range(5, 16):
+        body = b"/X Do " * 50 if i < 15 else b"BT ET"
+        fans.append(b"<< /Type /XObject /Subtype /Form /Resources << /XObject << /X %d 0 R >> >> /Length %d >>\nstream\n" % (i + 1, len(body)) + body + b"\nendstream")
+    write("hostile-form-fan", assemble(fans))
+    # Many fonts, each with a large ToUnicode map.
+    cmap = b"1 beginbfrange <0000> <FFFF> <0000> endbfrange endcmap"
+    fonts_doc = [b"<< /Type /Catalog /Pages 2 0 R >>",
+                 b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"]
+    entries = b" ".join(b"/F%d %d 0 R" % (i, i + 6) for i in range(300))
+    uses = b" ".join(b"/F%d 9 Tf" % i for i in range(300))
+    fonts_doc.append(b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << " + entries + b" >> >> >>")
+    fonts_doc.append(stream(b"BT " + uses + b" ET"))
+    fonts_doc.append(stream(cmap))
+    fonts_doc.append(b"null")
+    for i in range(300):
+        fonts_doc.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /X /ToUnicode 5 0 R >>")
+    write("hostile-many-cmaps", assemble(fonts_doc))
+
 def describe():
     """What poppler and qpdf say about each file, for the reader to match."""
     from pypdf import PdfReader
