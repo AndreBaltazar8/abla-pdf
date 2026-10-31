@@ -1,0 +1,461 @@
+// RFC 1951 DEFLATE and the RFC 1950 zlib wrapper for FlateDecode streams: LZ77
+// with bounded hash chains and lazy matching, then for each block whichever of
+// stored, fixed Huffman and dynamic Huffman comes out smallest. The search is
+// capped, so the time per input byte is bounded whatever the input.
+
+import "abla/bytes"
+
+private val HASH_SIZE = 32768
+private val MAX_CHAIN = 48
+private val WINDOW = 32768
+private val BLOCK_SYMBOLS = 32768
+
+private fun lengthBases(): array<int> = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+    35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+private fun lengthExtras(): array<int> = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+    3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+private fun distBases(): array<int> = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+    257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+private fun distExtras(): array<int> = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+    7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+private val LENGTH_BASE = lengthBases()
+private val LENGTH_EXTRA = lengthExtras()
+private val DIST_BASE = distBases()
+private val DIST_EXTRA = distExtras()
+private val CODE_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+
+private fun lengthCodes(): array<int> {
+    val table = filledArray(259, 0)
+    for (code in 0 until 29) {
+        val top = if (code == 28) 258 else LENGTH_BASE[code] + (1 << LENGTH_EXTRA[code]) - 1
+        for (len in LENGTH_BASE[code] until top + 1) table[len] = code
+    }
+    table[258] = 28
+    table
+}
+
+private val LENGTH_CODE = lengthCodes()
+
+private fun distCode(distance: int): int {
+    var low = 0
+    var high = 29
+    while (low < high) {
+        val mid = (low + high + 1) / 2
+        if (DIST_BASE[mid] <= distance) low = mid else high = mid - 1
+    }
+    low
+}
+
+private class BitOut(val out: ByteBuffer, var bits: int, var count: int) {
+    fun put(value: int, length: int): void {
+        bits = bits | (value << count)
+        count = count + length
+        while (count >= 8) {
+            out.appendByteValue(bits & 255)
+            bits = bits >>> 8
+            count = count - 8
+        }
+    }
+
+    fun align(): void {
+        if (count > 0) {
+            out.appendByteValue(bits & 255)
+            bits = 0
+            count = 0
+        }
+    }
+}
+
+private fun reverseBits(value: int, count: int): int {
+    var input = value
+    var output = 0
+    for (i in 0 until count) {
+        output = (output << 1) | (input & 1)
+        input = input >> 1
+    }
+    output
+}
+
+// Code lengths at most `maxBits` for the frequencies: Huffman's construction,
+// then lengths over the limit are clamped and the Kraft sum repaired.
+private fun huffmanLengths(freqs: array<int>, maxBits: int): array<int> {
+    val n = freqs.size
+    val lengths = filledArray(n, 0)
+    val used: array<int> = []
+    for (i in 0 until n) if (freqs[i] > 0) used.append(i)
+    if (used.size == 0) {
+        lengths[0] = 1
+        lengths[1] = 1
+        return lengths
+    }
+    if (used.size == 1) {
+        lengths[used[0]] = 1
+        lengths[if (used[0] == 0) 1 else 0] = 1
+        return lengths
+    }
+    // Insertion sort by frequency: at most 286 symbols.
+    for (i in 1 until used.size) {
+        val s = used[i]
+        var j = i - 1
+        while (j >= 0 && freqs[used[j]] > freqs[s]) {
+            used[j + 1] = used[j]
+            j = j - 1
+        }
+        used[j + 1] = s
+    }
+    val m = used.size
+    val weight = filledArray(2 * m, 0)
+    val parent = filledArray(2 * m, -1)
+    for (i in 0 until m) weight[i] = freqs[used[i]]
+    var leaf = 0
+    var inner = m
+    var next = m
+    while (next < 2 * m - 1) {
+        var a = 0
+        if (leaf < m && (inner >= next || weight[leaf] <= weight[inner])) { a = leaf; leaf = leaf + 1 }
+        else { a = inner; inner = inner + 1 }
+        var b = 0
+        if (leaf < m && (inner >= next || weight[leaf] <= weight[inner])) { b = leaf; leaf = leaf + 1 }
+        else { b = inner; inner = inner + 1 }
+        weight[next] = weight[a] + weight[b]
+        parent[a] = next
+        parent[b] = next
+        next = next + 1
+    }
+    val depth = filledArray(2 * m, 0)
+    var node = 2 * m - 3
+    while (node >= 0) {
+        depth[node] = depth[parent[node]] + 1
+        node = node - 1
+    }
+    for (i in 0 until m) lengths[used[i]] = if (depth[i] > maxBits) maxBits else depth[i]
+    var kraft = 0
+    for (i in 0 until m) kraft = kraft + (1 << (maxBits - lengths[used[i]]))
+    val limit = 1 << maxBits
+    // Lengthen the least frequent codes that have room until the sum fits.
+    var i = 0
+    while (kraft > limit) {
+        val s = used[i]
+        if (lengths[s] < maxBits) {
+            kraft = kraft - (1 << (maxBits - lengths[s] - 1))
+            lengths[s] = lengths[s] + 1
+        } else i = i + 1
+        if (i >= m) i = 0
+    }
+    // Then give any room left back to the most frequent codes.
+    var k = m - 1
+    while (k >= 0) {
+        val s = used[k]
+        while (lengths[s] > 1 && kraft + (1 << (maxBits - lengths[s])) <= limit) {
+            kraft = kraft + (1 << (maxBits - lengths[s]))
+            lengths[s] = lengths[s] - 1
+        }
+        k = k - 1
+    }
+    lengths
+}
+
+private fun canonicalCodes(lengths: array<int>): array<int> {
+    val count = filledArray(17, 0)
+    for (l in lengths) count[l] = count[l] + 1
+    count[0] = 0
+    val nextCode = filledArray(17, 0)
+    var code = 0
+    for (bits in 1 until 17) {
+        code = (code + count[bits - 1]) << 1
+        nextCode[bits] = code
+    }
+    val codes = filledArray(lengths.size, 0)
+    for (i in 0 until lengths.size) {
+        val l = lengths[i]
+        if (l != 0) {
+            codes[i] = reverseBits(nextCode[l], l)
+            nextCode[l] = nextCode[l] + 1
+        }
+    }
+    codes
+}
+
+private fun fixedLiteralLengths(): array<int> {
+    val lengths = filledArray(288, 0)
+    for (i in 0 until 288) lengths[i] = if (i < 144) 8 else if (i < 256) 9 else if (i < 280) 7 else 8
+    lengths
+}
+
+private val FIXED_LIT_LENGTHS = fixedLiteralLengths()
+private val FIXED_LIT_CODES = canonicalCodes(FIXED_LIT_LENGTHS)
+private val FIXED_DIST_LENGTHS = filledArray(30, 5)
+private val FIXED_DIST_CODES = canonicalCodes(FIXED_DIST_LENGTHS)
+
+// The run-length form of the code lengths, as (symbol, extra) pairs.
+private fun encodeCodeLengths(all: array<int>): array<int> {
+    val out: array<int> = []
+    var i = 0
+    val n = all.size
+    while (i < n) {
+        val v = all[i]
+        var run = 1
+        while (i + run < n && all[i + run] == v) run = run + 1
+        i = i + run
+        if (v == 0) {
+            while (run >= 11) {
+                val take = if (run > 138) 138 else run
+                out.append(18)
+                out.append(take - 11)
+                run = run - take
+            }
+            if (run >= 3) {
+                out.append(17)
+                out.append(run - 3)
+                run = 0
+            }
+            while (run > 0) {
+                out.append(0)
+                out.append(0)
+                run = run - 1
+            }
+        } else {
+            out.append(v)
+            out.append(0)
+            run = run - 1
+            while (run >= 3) {
+                val take = if (run > 6) 6 else run
+                out.append(16)
+                out.append(take - 3)
+                run = run - take
+            }
+            while (run > 0) {
+                out.append(v)
+                out.append(0)
+                run = run - 1
+            }
+        }
+    }
+    out
+}
+
+private class Block(
+    val literal: array<int>,
+    val distance: array<int>,
+    val litFreq: array<int>,
+    val distFreq: array<int>,
+    var rawBegin: int,
+    var rawEnd: int
+)
+
+private fun newBlock(begin: int): Block =
+    Block([], [], filledArray(286, 0), filledArray(30, 0), begin, begin)
+
+private fun symbolBits(block: Block, litLengths: array<int>, distLengths: array<int>): int {
+    var total = 0
+    for (i in 0 until 286) {
+        val f = block.litFreq[i]
+        if (f > 0) {
+            total = total + f * litLengths[i]
+            if (i >= 257) total = total + f * LENGTH_EXTRA[i - 257]
+        }
+    }
+    for (i in 0 until 30) {
+        val f = block.distFreq[i]
+        if (f > 0) total = total + f * (distLengths[i] + DIST_EXTRA[i])
+    }
+    total
+}
+
+private fun writeSymbols(
+    block: Block,
+    var out: BitOut,
+    litLengths: array<int>,
+    litCodes: array<int>,
+    distLengths: array<int>,
+    distCodes: array<int>
+): void {
+    val count = block.literal.size
+    for (i in 0 until count) {
+        val value = block.literal[i]
+        val distance = block.distance[i]
+        if (distance == 0) out.put(litCodes[value], litLengths[value])
+        else {
+            val code = LENGTH_CODE[value]
+            out.put(litCodes[257 + code], litLengths[257 + code])
+            out.put(value - LENGTH_BASE[code], LENGTH_EXTRA[code])
+            val dc = distCode(distance)
+            out.put(distCodes[dc], distLengths[dc])
+            out.put(distance - DIST_BASE[dc], DIST_EXTRA[dc])
+        }
+    }
+    out.put(litCodes[256], litLengths[256])
+    return
+}
+
+private fun writeBlock(var block: Block, source: string, final: bool, var out: BitOut): void {
+    block.litFreq[256] = 1
+    val litLengths = huffmanLengths(block.litFreq, 15)
+    val distLengths = huffmanLengths(block.distFreq, 15)
+    var nlen = 286
+    while (nlen > 257 && litLengths[nlen - 1] == 0) nlen = nlen - 1
+    var ndist = 30
+    while (ndist > 1 && distLengths[ndist - 1] == 0) ndist = ndist - 1
+    val all: array<int> = []
+    for (i in 0 until nlen) all.append(litLengths[i])
+    for (i in 0 until ndist) all.append(distLengths[i])
+    val rle = encodeCodeLengths(all)
+    val clFreq = filledArray(19, 0)
+    var r = 0
+    while (r < rle.size) {
+        clFreq[rle[r]] = clFreq[rle[r]] + 1
+        r = r + 2
+    }
+    val clLengths = huffmanLengths(clFreq, 7)
+    var ncode = 19
+    while (ncode > 4 && clLengths[CODE_ORDER[ncode - 1]] == 0) ncode = ncode - 1
+    var headerBits = 14 + 3 * ncode
+    r = 0
+    while (r < rle.size) {
+        val s = rle[r]
+        headerBits = headerBits + clLengths[s] + (if (s == 16) 2 else if (s == 17) 3 else if (s == 18) 7 else 0)
+        r = r + 2
+    }
+    val dynamicBits = headerBits + symbolBits(block, litLengths, distLengths)
+    val fixedBits = symbolBits(block, FIXED_LIT_LENGTHS, FIXED_DIST_LENGTHS)
+    val rawSize = block.rawEnd - block.rawBegin
+    val storedBits = (rawSize + 5 * (rawSize / 65535 + 1)) * 8
+    val finalBit = if (final) 1 else 0
+    if (storedBits < dynamicBits && storedBits < fixedBits) {
+        var at = block.rawBegin
+        var going = true
+        while (going) {
+            val take = if (block.rawEnd - at > 65535) 65535 else block.rawEnd - at
+            val last = at + take == block.rawEnd
+            out.put(if (last) finalBit else 0, 1)
+            out.put(0, 2)
+            out.align()
+            out.put(take, 16)
+            out.put(take ^ 0xffff, 16)
+            out.out.appendText(source.slice(at, at + take))
+            at = at + take
+            if (last) going = false
+        }
+    } else if (fixedBits <= dynamicBits) {
+        out.put(finalBit, 1)
+        out.put(1, 2)
+        writeSymbols(block, out, FIXED_LIT_LENGTHS, FIXED_LIT_CODES, FIXED_DIST_LENGTHS, FIXED_DIST_CODES)
+    } else {
+        out.put(finalBit, 1)
+        out.put(2, 2)
+        out.put(nlen - 257, 5)
+        out.put(ndist - 1, 5)
+        out.put(ncode - 4, 4)
+        for (i in 0 until ncode) out.put(clLengths[CODE_ORDER[i]], 3)
+        val clCodes = canonicalCodes(clLengths)
+        r = 0
+        while (r < rle.size) {
+            val s = rle[r]
+            out.put(clCodes[s], clLengths[s])
+            if (s == 16) out.put(rle[r + 1], 2)
+            else if (s == 17) out.put(rle[r + 1], 3)
+            else if (s == 18) out.put(rle[r + 1], 7)
+            r = r + 2
+        }
+        writeSymbols(block, out, litLengths, canonicalCodes(litLengths), distLengths, canonicalCodes(distLengths))
+    }
+    return
+}
+
+private class Matcher(val source: string, val head: array<int>, val prev: array<int>) {
+    fun hash(at: int): int =
+        ((source[at] << 10) ^ (source[at + 1] << 5) ^ source[at + 2]) & (HASH_SIZE - 1)
+
+    fun insert(at: int): void {
+        if (at + 2 < source.size) {
+            val h = hash(at)
+            prev[at & (WINDOW - 1)] = head[h]
+            head[h] = at
+        }
+    }
+
+    // The longest match at `at`, packed as length * 65536 + distance.
+    fun longest(at: int): int {
+        if (at + 2 >= source.size) return 0
+        val n = source.size
+        val maxLength = if (n - at > 258) 258 else n - at
+        var candidate = head[hash(at)]
+        var bestLength = 0
+        var bestDistance = 0
+        var chain = MAX_CHAIN
+        val floor = at - WINDOW + 1
+        while (candidate >= 0 && candidate >= floor && candidate < at && chain > 0) {
+            var length = 0
+            if (bestLength == 0 || source[candidate + bestLength] == source[at + bestLength]) {
+                while (length < maxLength && source[candidate + length] == source[at + length]) length = length + 1
+            }
+            if (length > bestLength) {
+                bestLength = length
+                bestDistance = at - candidate
+                if (length == maxLength) return bestLength * 65536 + bestDistance
+            }
+            candidate = prev[candidate & (WINDOW - 1)]
+            chain = chain - 1
+        }
+        if (bestLength < 3) return 0
+        bestLength * 65536 + bestDistance
+    }
+}
+
+// Raw DEFLATE data for `source`.
+fun pdfDeflate(source: string): string {
+    val out = BitOut(byteBuffer(), 0, 0)
+    val matcher = Matcher(source, filledArray(HASH_SIZE, -1), filledArray(WINDOW, -1))
+    var block = newBlock(0)
+    val n = source.size
+    var at = 0
+    while (at < n) {
+        var match = matcher.longest(at)
+        matcher.insert(at)
+        var length = match >> 16
+        // Lazy matching: a longer match one byte on beats this one.
+        if (length >= 3 && length < 32 && at + 1 < n) {
+            val next = matcher.longest(at + 1)
+            if ((next >> 16) > length) {
+                length = 0
+                match = 0
+            }
+        }
+        if (length >= 3) {
+            val distance = match & 65535
+            block.literal.append(length)
+            block.distance.append(distance)
+            block.litFreq[257 + LENGTH_CODE[length]] = block.litFreq[257 + LENGTH_CODE[length]] + 1
+            val dc = distCode(distance)
+            block.distFreq[dc] = block.distFreq[dc] + 1
+            for (k in 1 until length) matcher.insert(at + k)
+            at = at + length
+        } else {
+            block.literal.append(source[at])
+            block.distance.append(0)
+            block.litFreq[source[at]] = block.litFreq[source[at]] + 1
+            at = at + 1
+        }
+        if (block.literal.size >= BLOCK_SYMBOLS) {
+            block.rawEnd = at
+            writeBlock(block, source, at >= n, out)
+            block = newBlock(at)
+        }
+    }
+    if (block.literal.size > 0 || n == 0) {
+        block.rawEnd = at
+        writeBlock(block, source, true, out)
+    }
+    out.align()
+    out.out.toText()
+}
+
+// A zlib stream for `source`, as a FlateDecode stream holds.
+fun pdfZlibCompress(source: string): string {
+    val out = byteBuffer()
+    out.appendByteValue(0x78)
+    out.appendByteValue(0x9c)
+    out.appendText(pdfDeflate(source))
+    out.pdfAppendU32(pdfAdler32(source))
+    out.toText()
+}

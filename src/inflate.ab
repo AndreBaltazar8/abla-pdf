@@ -1,0 +1,345 @@
+// RFC 1951 inflate and the RFC 1950 zlib wrapper. Every read is bounded by the
+// input and every write by `maxOutput`, so a truncated or hostile stream ends
+// in a result with `ok = false`, never a panic, and a decompression bomb stops
+// at the limit. What decoded before an error stays in `data`.
+
+import "abla/bytes"
+
+class PdfInflateResult(
+    val data: string,
+    val ok: bool,
+    val error: string,
+    val consumed: int
+)
+
+private val FAST_BITS = 9
+
+private class HuffTable(
+    val count: array<int>,
+    val symbol: array<int>,
+    val fast: array<int>,
+    val valid: bool
+)
+
+private fun lengthBases(): array<int> = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+    35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+private fun lengthExtras(): array<int> = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+    3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+private fun distBases(): array<int> = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+    257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+private fun distExtras(): array<int> = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+    7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+private val LENGTH_BASE = lengthBases()
+private val LENGTH_EXTRA = lengthExtras()
+private val DIST_BASE = distBases()
+private val DIST_EXTRA = distExtras()
+private val CODE_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+
+private fun reverseBits(value: int, count: int): int {
+    var input = value
+    var output = 0
+    for (i in 0 until count) {
+        output = (output << 1) | (input & 1)
+        input = input >> 1
+    }
+    output
+}
+
+private fun buildTable(lengths: array<int>, begin: int, n: int): HuffTable {
+    val count = filledArray(16, 0)
+    for (i in 0 until n) count[lengths[begin + i]] = count[lengths[begin + i]] + 1
+    val fast = filledArray(1 << FAST_BITS, 0)
+    val symbol = filledArray(n, 0)
+    count[0] = 0
+    var left = 1
+    var valid = true
+    for (len in 1 until 16) {
+        left = left * 2 - count[len]
+        if (left < 0) valid = false
+    }
+    val offsets = filledArray(16, 0)
+    val nextCode = filledArray(16, 0)
+    var code = 0
+    for (len in 1 until 15) {
+        offsets[len + 1] = offsets[len] + count[len]
+    }
+    for (len in 1 until 16) {
+        code = (code + count[len - 1]) << 1
+        nextCode[len] = code
+    }
+    if (valid) {
+        for (i in 0 until n) {
+            val len = lengths[begin + i]
+            if (len != 0) {
+                symbol[offsets[len]] = i
+                offsets[len] = offsets[len] + 1
+                val assigned = nextCode[len]
+                nextCode[len] = assigned + 1
+                if (len <= FAST_BITS) {
+                    val reversed = reverseBits(assigned, len)
+                    var slot = reversed
+                    val step = 1 << len
+                    while (slot < (1 << FAST_BITS)) {
+                        fast[slot] = (i << 4) | len
+                        slot = slot + step
+                    }
+                }
+            }
+        }
+    }
+    HuffTable(count, symbol, fast, valid)
+}
+
+private class InflateState(
+    val source: string,
+    var pos: int,
+    var bits: int,
+    var bitCount: int,
+    val window: array<int>,
+    var windowPos: int,
+    val out: ByteBuffer,
+    var outCount: int,
+    val maxOutput: int,
+    var error: string
+) {
+    fun refill(): void {
+        while (bitCount <= 48 && pos < source.size) {
+            bits = bits | (source[pos] << bitCount)
+            pos = pos + 1
+            bitCount = bitCount + 8
+        }
+    }
+
+    fun take(count: int): int {
+        if (count == 0) return 0
+        if (bitCount < count) {
+            refill()
+            if (bitCount < count) {
+                if (error == "") error = "truncated deflate stream"
+                bitCount = 0
+                bits = 0
+                return 0
+            }
+        }
+        val value = bits & ((1 << count) - 1)
+        bits = bits >>> count
+        bitCount = bitCount - count
+        value
+    }
+
+    fun decode(table: HuffTable): int {
+        if (bitCount < 15) refill()
+        val entry = table.fast[bits & ((1 << FAST_BITS) - 1)]
+        if (entry != 0) {
+            val len = entry & 15
+            if (len > bitCount) {
+                if (error == "") error = "truncated deflate stream"
+                return -1
+            }
+            bits = bits >>> len
+            bitCount = bitCount - len
+            return entry >> 4
+        }
+        var code = 0
+        var first = 0
+        var index = 0
+        var len = 1
+        while (len <= 15) {
+            if (bitCount == 0) {
+                if (error == "") error = "truncated deflate stream"
+                return -1
+            }
+            code = code | (bits & 1)
+            bits = bits >>> 1
+            bitCount = bitCount - 1
+            val c = table.count[len]
+            if (code - c < first) return table.symbol[index + (code - first)]
+            index = index + c
+            first = (first + c) << 1
+            code = code << 1
+            len = len + 1
+        }
+        if (error == "") error = "invalid deflate code"
+        -1
+    }
+
+    fun emit(value: int): bool {
+        if (outCount >= maxOutput) {
+            if (error == "") error = "decompressed data exceeds the limit"
+            return false
+        }
+        out.appendByteValue(value)
+        outCount = outCount + 1
+        window[windowPos] = value
+        windowPos = (windowPos + 1) & 32767
+        true
+    }
+
+    fun stored(): bool {
+        val drop = bitCount & 7
+        bits = bits >>> drop
+        bitCount = bitCount - drop
+        val length = take(16)
+        val inverse = take(16)
+        if (error != "") return false
+        if ((length ^ inverse) != 0xffff) {
+            error = "invalid stored block"
+            return false
+        }
+        for (i in 0 until length) {
+            val b = take(8)
+            if (error != "") return false
+            if (!emit(b)) return false
+        }
+        true
+    }
+
+    fun compressed(literals: HuffTable, distances: HuffTable): bool {
+        while (true) {
+            val symbol = decode(literals)
+            if (symbol < 0) return false
+            if (symbol < 256) {
+                if (!emit(symbol)) return false
+            } else if (symbol == 256) return true
+            else {
+                val li = symbol - 257
+                if (li >= 29) {
+                    error = "invalid length code"
+                    return false
+                }
+                val length = LENGTH_BASE[li] + take(LENGTH_EXTRA[li])
+                val di = decode(distances)
+                if (di < 0) return false
+                if (di >= 30) {
+                    error = "invalid distance code"
+                    return false
+                }
+                val distance = DIST_BASE[di] + take(DIST_EXTRA[di])
+                if (error != "") return false
+                if (distance > outCount) {
+                    error = "distance before the start of the output"
+                    return false
+                }
+                for (k in 0 until length) {
+                    if (!emit(window[(windowPos - distance) & 32767])) return false
+                }
+            }
+        }
+        false
+    }
+
+    fun dynamicBlock(): bool {
+        val nlen = take(5) + 257
+        val ndist = take(5) + 1
+        val ncode = take(4) + 4
+        if (error != "") return false
+        if (nlen > 286 || ndist > 30) {
+            error = "invalid code counts"
+            return false
+        }
+        val lengths = filledArray(320, 0)
+        for (i in 0 until ncode) lengths[CODE_ORDER[i]] = take(3)
+        if (error != "") return false
+        val codes = buildTable(lengths, 0, 19)
+        if (!codes.valid) {
+            error = "invalid code length code"
+            return false
+        }
+        for (i in 0 until 19) lengths[i] = 0
+        var index = 0
+        val all = filledArray(320, 0)
+        while (index < nlen + ndist) {
+            val symbol = decode(codes)
+            if (symbol < 0) return false
+            if (symbol < 16) {
+                all[index] = symbol
+                index = index + 1
+            } else {
+                var previous = 0
+                var repeat = 0
+                if (symbol == 16) {
+                    if (index == 0) {
+                        error = "repeat with no previous length"
+                        return false
+                    }
+                    previous = all[index - 1]
+                    repeat = 3 + take(2)
+                } else if (symbol == 17) repeat = 3 + take(3)
+                else repeat = 11 + take(7)
+                if (error != "") return false
+                if (index + repeat > nlen + ndist) {
+                    error = "too many code lengths"
+                    return false
+                }
+                for (k in 0 until repeat) {
+                    all[index] = previous
+                    index = index + 1
+                }
+            }
+        }
+        if (all[256] == 0) {
+            error = "no end of block code"
+            return false
+        }
+        val literals = buildTable(all, 0, nlen)
+        val distances = buildTable(all, nlen, ndist)
+        if (!literals.valid || !distances.valid) {
+            error = "invalid literal or distance code"
+            return false
+        }
+        compressed(literals, distances)
+    }
+}
+
+private fun fixedLengths(): array<int> {
+    val lengths = filledArray(320, 0)
+    for (i in 0 until 288) lengths[i] = if (i < 144) 8 else if (i < 256) 9 else if (i < 280) 7 else 8
+    for (i in 288 until 318) lengths[i] = 5
+    lengths
+}
+
+private val FIXED_ALL = fixedLengths()
+private val FIXED_LITERALS = buildTable(FIXED_ALL, 0, 288)
+private val FIXED_DISTANCES = buildTable(FIXED_ALL, 288, 30)
+
+// Decompresses raw DEFLATE data from byte `begin`.
+fun pdfInflate(source: string, begin: int = 0, maxOutput: int = 268435456): PdfInflateResult {
+    val state = InflateState(source, begin, 0, 0, filledArray(32768, 0), 0, byteBuffer(), 0, maxOutput, "")
+    var finished = false
+    var running = true
+    while (running) {
+        val last = state.take(1)
+        val kind = state.take(2)
+        if (state.error != "") running = false
+        else {
+            var good = false
+            if (kind == 0) good = state.stored()
+            else if (kind == 1) good = state.compressed(FIXED_LITERALS, FIXED_DISTANCES)
+            else if (kind == 2) good = state.dynamicBlock()
+            else state.error = "invalid block type"
+            if (!good) running = false
+            else if (last == 1) {
+                finished = true
+                running = false
+            }
+        }
+    }
+    val unread = state.bitCount / 8
+    PdfInflateResult(state.out.toText(), finished && state.error == "", state.error, state.pos - unread)
+}
+
+// Decompresses a zlib stream. Common damage is tolerated as other readers do: a
+// stray end of line before the header, a wrong or missing Adler-32 checksum, a
+// missing header (taken as raw DEFLATE).
+fun pdfZlibDecompress(source: string, maxOutput: int = 268435456): PdfInflateResult {
+    var begin = 0
+    while (begin < source.size && begin < 4 && (source[begin] == 10 || source[begin] == 13)) begin = begin + 1
+    if (begin + 2 <= source.size) {
+        val cmf = source[begin]
+        val flg = source[begin + 1]
+        if ((cmf & 15) == 8 && (cmf * 256 + flg) % 31 == 0 && (flg & 32) == 0) {
+            return pdfInflate(source, begin + 2, maxOutput)
+        }
+    }
+    pdfInflate(source, begin, maxOutput)
+}

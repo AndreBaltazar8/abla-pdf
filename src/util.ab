@@ -1,0 +1,258 @@
+// Small helpers shared by the writer and the reader: number and string
+// formatting in PDF syntax, UTF-8 and UTF-16 conversion, byte reads.
+
+import "abla/bytes"
+import "abla/float"
+import "abla/math"
+
+private val HEX_UPPER = "0123456789ABCDEF"
+
+// `value` in plain decimal, the only form PDF allows: no exponent, at most
+// `decimals` digits after the point and no trailing zeros. NaN writes 0.
+fun pdfNumber(value: f64, decimals: int = 4): string {
+    if (value != value) return "0"
+    var scale = 1
+    for (i in 0 until decimals) scale = scale * 10
+    var magnitude = if (value < 0.0) 0.0 - value else value
+    if (magnitude > 1000000000.0) magnitude = 1000000000.0
+    val scaled = f64ToInt(floor(magnitude * f64FromInt(scale) + 0.5))
+    if (scaled == 0) return "0"
+    val whole = scaled / scale
+    val sign = if (value < 0.0) "-" else ""
+    var fraction = scaled % scale
+    if (fraction == 0) return "$sign$whole"
+    var digits = decimals
+    while (fraction % 10 == 0) {
+        fraction = fraction / 10
+        digits = digits - 1
+    }
+    var text = "$fraction"
+    while (text.size < digits) text = "0$text"
+    "$sign$whole.$text"
+}
+
+fun pdfHexByte(value: int): string {
+    val low = HEX_UPPER.slice(value & 15, (value & 15) + 1)
+    val high = HEX_UPPER.slice((value >> 4) & 15, ((value >> 4) & 15) + 1)
+    high + low
+}
+
+fun pdfHexU16(value: int): string = pdfHexByte((value >> 8) & 255) + pdfHexByte(value & 255)
+
+fun pdfHexEncode(data: string): string {
+    val out = byteBuffer()
+    for (b in data) out.appendText(pdfHexByte(b))
+    out.toText()
+}
+
+// Hexadecimal digits to bytes. Anything else in the text is skipped, and an odd
+// final digit counts as if followed by 0, as PDF hex strings do.
+fun pdfHexDecode(text: string): string {
+    val out = byteBuffer()
+    var high = -1
+    for (c in text) {
+        val digit = pdfHexDigit(c)
+        if (digit >= 0) {
+            if (high < 0) high = digit
+            else {
+                out.appendByteValue(high * 16 + digit)
+                high = -1
+            }
+        }
+    }
+    if (high >= 0) out.appendByteValue(high * 16)
+    out.toText()
+}
+
+fun pdfHexDigit(c: int): int {
+    if (c >= 48 && c <= 57) return c - 48
+    if (c >= 65 && c <= 70) return c - 55
+    if (c >= 97 && c <= 102) return c - 87
+    -1
+}
+
+// The code points of UTF-8 text. A malformed sequence gives one U+FFFD per bad
+// byte rather than failing.
+fun pdfUtf8Decode(text: string): array<int> {
+    val out: array<int> = []
+    var i = 0
+    val n = text.size
+    while (i < n) {
+        val b = text[i]
+        var need = 0
+        var cp = b
+        var least = 0
+        if (b >= 0xf0 && b <= 0xf4) { need = 3; cp = b & 7; least = 0x10000 }
+        else if (b >= 0xe0 && b < 0xf0) { need = 2; cp = b & 15; least = 0x800 }
+        else if (b >= 0xc2 && b < 0xe0) { need = 1; cp = b & 31; least = 0x80 }
+        else if (b >= 0x80) { need = -1 }
+        if (need < 0 || i + need >= n) {
+            out.append(0xfffd)
+            i = i + 1
+            continue
+        }
+        var good = true
+        for (k in 1 until need + 1) {
+            val next = text[i + k]
+            if ((next & 0xc0) != 0x80) good = false
+            else cp = (cp << 6) | (next & 63)
+        }
+        if (!good || cp < least || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) {
+            out.append(0xfffd)
+            i = i + 1
+            continue
+        }
+        out.append(cp)
+        i = i + need + 1
+    }
+    out
+}
+
+fun ByteBuffer.pdfAppendUtf8(cp: int): void {
+    if (cp < 0x80) this.appendByteValue(cp)
+    else if (cp < 0x800) {
+        this.appendByteValue(0xc0 | (cp >> 6))
+        this.appendByteValue(0x80 | (cp & 63))
+    } else if (cp < 0x10000) {
+        this.appendByteValue(0xe0 | (cp >> 12))
+        this.appendByteValue(0x80 | ((cp >> 6) & 63))
+        this.appendByteValue(0x80 | (cp & 63))
+    } else {
+        this.appendByteValue(0xf0 | (cp >> 18))
+        this.appendByteValue(0x80 | ((cp >> 12) & 63))
+        this.appendByteValue(0x80 | ((cp >> 6) & 63))
+        this.appendByteValue(0x80 | (cp & 63))
+    }
+    return
+}
+
+// UTF-16BE, with surrogate pairs above the basic plane, as hexadecimal.
+fun pdfUtf16Hex(cp: int): string {
+    if (cp < 0x10000) return pdfHexU16(cp)
+    val v = cp - 0x10000
+    pdfHexU16(0xd800 + (v >> 10)) + pdfHexU16(0xdc00 + (v & 0x3ff))
+}
+
+// UTF-16BE bytes to UTF-8 text.
+fun pdfUtf16ToUtf8(data: string, begin: int = 0, littleEndian: bool = false): string {
+    val out = byteBuffer()
+    var i = begin
+    while (i + 1 < data.size) {
+        var unit = if (littleEndian) data[i] | (data[i + 1] << 8) else (data[i] << 8) | data[i + 1]
+        i = i + 2
+        if (unit >= 0xd800 && unit < 0xdc00 && i + 1 < data.size) {
+            val low = if (littleEndian) data[i] | (data[i + 1] << 8) else (data[i] << 8) | data[i + 1]
+            if (low >= 0xdc00 && low < 0xe000) {
+                unit = 0x10000 + ((unit - 0xd800) << 10) + (low - 0xdc00)
+                i = i + 2
+            }
+        }
+        if (unit >= 0xd800 && unit < 0xe000) unit = 0xfffd
+        out.pdfAppendUtf8(unit)
+    }
+    out.toText()
+}
+
+// A PDF string token for text: a literal for plain ASCII, otherwise UTF-16BE
+// with a byte order mark, which every PDF version reads.
+fun pdfTextStringToken(text: string): string {
+    var ascii = true
+    for (b in text) if (b < 32 || b > 126) ascii = false
+    if (ascii) return pdfLiteralString(text)
+    val out = byteBuffer()
+    out.appendText("<FEFF")
+    for (cp in pdfUtf8Decode(text)) out.appendText(pdfUtf16Hex(cp))
+    out.appendText(">")
+    out.toText()
+}
+
+// A literal string token holding arbitrary bytes.
+fun pdfLiteralString(data: string): string {
+    val out = byteBuffer()
+    out.appendText("(")
+    for (b in data) {
+        if (b == 40 || b == 41 || b == 92) {
+            out.appendByteValue(92)
+            out.appendByteValue(b)
+        } else if (b < 32 || b > 126) {
+            out.appendByteValue(92)
+            out.appendByteValue(48 + ((b >> 6) & 7))
+            out.appendByteValue(48 + ((b >> 3) & 7))
+            out.appendByteValue(48 + (b & 7))
+        } else out.appendByteValue(b)
+    }
+    out.appendText(")")
+    out.toText()
+}
+
+// A name token with `#xx` for everything a name can't hold directly.
+fun pdfNameToken(name: string): string {
+    val out = byteBuffer()
+    out.appendText("/")
+    for (b in name) {
+        val delimiter = b == 40 || b == 41 || b == 60 || b == 62 || b == 91 || b == 93 ||
+            b == 123 || b == 125 || b == 47 || b == 37 || b == 35
+        if (b <= 32 || b >= 127 || delimiter) {
+            out.appendText("#")
+            out.appendText(pdfHexByte(b))
+        } else out.appendByteValue(b)
+    }
+    out.toText()
+}
+
+fun pdfAdler32(data: string): int {
+    var a = 1
+    var b = 0
+    var i = 0
+    val n = data.size
+    while (i < n) {
+        val stop = if (i + 5552 < n) i + 5552 else n
+        while (i < stop) {
+            a = a + data[i]
+            b = b + a
+            i = i + 1
+        }
+        a = a % 65521
+        b = b % 65521
+    }
+    (b << 16) | a
+}
+
+fun pdfU16(data: string, at: int): int =
+    if (at < 0 || at + 2 > data.size) 0 else (data[at] << 8) | data[at + 1]
+
+fun pdfI16(data: string, at: int): int {
+    val v = pdfU16(data, at)
+    if (v >= 32768) v - 65536 else v
+}
+
+fun pdfU32(data: string, at: int): int =
+    if (at < 0 || at + 4 > data.size) 0
+    else (data[at] << 24) | (data[at + 1] << 16) | (data[at + 2] << 8) | data[at + 3]
+
+fun ByteBuffer.pdfAppendU16(value: int): void {
+    this.appendByteValue((value >> 8) & 255)
+    this.appendByteValue(value & 255)
+    return
+}
+
+fun ByteBuffer.pdfAppendU32(value: int): void {
+    this.appendByteValue((value >> 24) & 255)
+    this.appendByteValue((value >> 16) & 255)
+    this.appendByteValue((value >> 8) & 255)
+    this.appendByteValue(value & 255)
+    return
+}
+
+fun pdfStartsWithAt(data: string, at: int, prefix: string): bool {
+    if (at < 0 || at + prefix.size > data.size) return false
+    for (k in 0 until prefix.size) if (data[at + k] != prefix[k]) return false
+    true
+}
+
+// A slice clamped to the string, for offsets read out of a file.
+fun pdfClampedSlice(data: string, begin: int, end: int): string {
+    val b = if (begin < 0) 0 else if (begin > data.size) data.size else begin
+    val e = if (end < b) b else if (end > data.size) data.size else end
+    data.slice(b, e)
+}

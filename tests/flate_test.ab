@@ -1,0 +1,85 @@
+import "abla/test"
+import "abla/bytes"
+import "abla/text"
+import "../src/util.ab"
+import "../src/inflate.ab"
+import "../src/deflate.ab"
+
+// A deterministic pseudo-random byte string.
+fun noise(count: int, seed: int): string {
+    val out = byteBuffer()
+    var s = seed
+    for (i in 0 until count) {
+        s = (s * 1103515245 + 12345) & 0x7fffffff
+        out.appendByteValue((s >> 16) & 255)
+    }
+    out.toText()
+}
+
+fun skewed(count: int, seed: int): string {
+    val out = byteBuffer()
+    var s = seed
+    for (i in 0 until count) {
+        s = (s * 1103515245 + 12345) & 0x7fffffff
+        val r = (s >> 16) & 255
+        out.appendByteValue(if (r < 200) 65 + (r & 3) else r)
+    }
+    out.toText()
+}
+
+fun roundTrip(data: string, label: string): void {
+    val packed = pdfZlibCompress(data)
+    val back = pdfZlibDecompress(packed)
+    expect(back.ok, "$label: inflate ok (${back.error})")
+    expect(back.data == data, "$label: round trip")
+    expectEqual(back.consumed, packed.size - 4, "$label: consumed")
+    return
+}
+
+fun main: int {
+    roundTrip("", "empty")
+    roundTrip("a", "one byte")
+    roundTrip("abcabcabcabc", "short repeat")
+    roundTrip("x".repeat(100000), "long run")
+    roundTrip(noise(70000, 1), "incompressible")
+    roundTrip(skewed(200000, 7), "skewed, several blocks")
+    var phrase = ""
+    for (i in 0 until 400) phrase = phrase + "Fatura número $i, São João, ação ${i * 37}\n"
+    roundTrip(phrase, "text")
+    expect(pdfZlibCompress(phrase).size < phrase.size / 3, "text compresses")
+    expect(pdfZlibCompress(noise(70000, 1)).size < 70100, "noise stays near its size")
+
+    // Made by Python: zlib.compress(b"hello hello hello hello, dynamic and fixed blocks " * 20, 9).
+    val fromZlib = pdfHexDecode("78dacb48cdc9c957c840277514522af3127333931512f35214d2322b5253149272f293b38b31d58eea18d531aa6390eb0000a9076ab8")
+    expectEqual(pdfZlibDecompress(fromZlib).data, "hello hello hello hello, dynamic and fixed blocks ".repeat(20), "zlib vector")
+    val stored = pdfHexDecode("7801010300fcff616263024d0127")
+    expectEqual(pdfZlibDecompress(stored).data, "abc", "stored block")
+
+    // Damage ends in a result, never a panic.
+    val packed = pdfZlibCompress(phrase)
+    val cut = pdfZlibDecompress(packed.slice(0, packed.size / 2))
+    expect(!cut.ok, "truncated stream reports failure")
+    expect(cut.data.size > 0, "truncated stream keeps what decoded")
+    expect(phrase.startsWith(cut.data), "kept data is a prefix")
+    val bomb = pdfZlibDecompress(pdfZlibCompress("x".repeat(1000000)), 1000)
+    expect(!bomb.ok, "bomb stops at the limit")
+    expectEqual(bomb.data.size, 1000, "bomb output is bounded")
+    expect(!pdfInflate(pdfHexDecode("07")).ok, "invalid block type")
+    expect(!pdfInflate(pdfHexDecode("010100")).ok, "bad stored length")
+    // Random input and random corruption of valid input.
+    for (seed in 1 until 300) {
+        val junk = noise(seed * 3, seed)
+        val r = pdfInflate(junk, 0, 100000)
+        expect(r.data.size <= 100000, "junk bounded")
+    }
+    val base = pdfZlibCompress(skewed(4000, 3))
+    for (seed in 1 until 300) {
+        val b = byteBuffer()
+        b.appendText(base)
+        val at = (seed * 7919) % base.size
+        val damaged = base.slice(0, at) + noise(1, seed) + base.slice(at + 1, base.size)
+        val r = pdfZlibDecompress(damaged, 100000)
+        expect(r.data.size <= 100000, "corrupt bounded")
+    }
+    testsPassed()
+}

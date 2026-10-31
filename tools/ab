@@ -1,0 +1,4 @@
+#!/bin/sh
+# Runs the in-repo compiler inside its shell: tools/ab test tests/x_test.ab
+here=$(cd "$(dirname "$0")/.." && pwd)
+cd "$here" && exec nix-shell ../ablac/shell.nix --run "../ablac/build/ablac $*"
