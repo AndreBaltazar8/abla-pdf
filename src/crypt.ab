@@ -2,6 +2,7 @@
 // doesn't have: RC4, AES and SHA-384/512. Decrypting files is their only use, so
 // constant time isn't a goal here.
 
+import "util.ab"
 import "abla/bytes"
 import "abla/crypto"
 

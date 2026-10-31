@@ -1,6 +1,7 @@
 // The non-Flate stream filters and the predictors. All take a limit on the bytes
 // they produce and stop there; malformed input ends the output early.
 
+import "util.ab"
 import "abla/bytes"
 
 class PdfFilterResult(val data: string, val ok: bool, val error: string)

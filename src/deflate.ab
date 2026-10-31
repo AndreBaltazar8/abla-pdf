@@ -3,6 +3,7 @@
 // stored, fixed Huffman and dynamic Huffman comes out smallest. The search is
 // capped, so the time per input byte is bounded whatever the input.
 
+import "util.ab"
 import "abla/bytes"
 
 private val HASH_SIZE = 32768

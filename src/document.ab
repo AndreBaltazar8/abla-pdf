@@ -1,6 +1,10 @@
 // What a document says about itself and its pages: metadata, page geometry, form
 // fields and annotations.
 
+import "util.ab"
+import "encoding_data.ab"
+import "writer.ab"
+import "reader.ab"
 import "abla/bytes"
 import "abla/date"
 import "abla/float"

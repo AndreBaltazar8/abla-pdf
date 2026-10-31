@@ -2,6 +2,7 @@
 // every read goes through bounds-checked helpers, and glyph traversal is limited
 // to the glyphs the font declares.
 
+import "util.ab"
 import "abla/bytes"
 import "abla/text"
 

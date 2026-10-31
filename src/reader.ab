@@ -6,6 +6,11 @@
 // where the work happens: the input can't cause a panic or an unbounded loop,
 // and past a limit a read just ends with less data and a note in `warnings`.
 
+import "util.ab"
+import "inflate.ab"
+import "filters.ab"
+import "crypt.ab"
+import "content.ab"
 import "abla/bytes"
 import "abla/crypto"
 import "abla/float"

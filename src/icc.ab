@@ -2,6 +2,7 @@
 // profile with the D50-adapted sRGB primaries and the sRGB transfer curve. PDF/A
 // needs one for its output intent.
 
+import "util.ab"
 import "abla/bytes"
 import "abla/float"
 import "abla/math"

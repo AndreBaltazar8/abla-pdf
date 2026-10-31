@@ -4,6 +4,12 @@
 // A page is drawn on its own and handed to the document with addPage, which
 // copies what it needs, so one PdfPage can be cleared and drawn again.
 
+import "util.ab"
+import "deflate.ab"
+import "encoding_data.ab"
+import "ttf.ab"
+import "image.ab"
+import "icc.ab"
 import "abla/bytes"
 import "abla/crypto"
 import "abla/date"

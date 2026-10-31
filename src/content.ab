@@ -1,6 +1,10 @@
 // Running page content: the graphics and text state needed to place text and
 // images, and fonts decoded far enough to turn character codes into Unicode.
 
+import "util.ab"
+import "encoding_data.ab"
+import "ttf.ab"
+import "reader.ab"
 import "abla/bytes"
 import "abla/math"
 import "abla/float"

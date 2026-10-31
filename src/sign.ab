@@ -8,6 +8,11 @@
 // the signature. It does not build a chain to a trust anchor, check revocation or
 // consult the EU Trusted List, so a valid result says nothing of who signed.
 
+import "util.ab"
+import "crypt.ab"
+import "image.ab"
+import "reader.ab"
+import "document.ab"
 import "abla/bytes"
 import "abla/crypto"
 import "abla/date"

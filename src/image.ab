@@ -1,6 +1,8 @@
 // Decoding image files into what a PDF image XObject holds. JPEG data passes
 // through unchanged; PNG is decoded to 8-bit samples with alpha split off.
 
+import "util.ab"
+import "inflate.ab"
 import "abla/bytes"
 
 class PdfDecodedImage(
