@@ -15,6 +15,7 @@ import "reader.ab"
 import "document.ab"
 import "abla/bytes"
 import "abla/crypto"
+import "abla/crypto/rsa"
 import "abla/date"
 import "abla/text"
 
@@ -121,150 +122,6 @@ private fun derNext(data: string, item: Der, limit: int): Der = derAt(data, item
 
 private fun derInside(data: string, item: Der): Der = derAt(data, item.begin, item.end)
 
-// --- Big integers: little-endian 28-bit limbs, Montgomery multiplication -----------
-
-private val LIMB_BITS = 28
-private val LIMB_MASK = 0xfffffff
-
-private fun limbsFromBytes(bytes: string): array<int> {
-    val out: array<int> = []
-    var accumulator = 0
-    var bits = 0
-    var i = bytes.size - 1
-    while (i >= 0) {
-        accumulator = accumulator | (bytes[i] << bits)
-        bits = bits + 8
-        if (bits >= LIMB_BITS) {
-            out.append(accumulator & LIMB_MASK)
-            accumulator = accumulator >> LIMB_BITS
-            bits = bits - LIMB_BITS
-        }
-        i = i - 1
-    }
-    if (bits > 0) out.append(accumulator)
-    out
-}
-
-private fun bytesFromLimbs(limbs: array<int>, size: int): string {
-    val digits = filledArray(size, 0)
-    var accumulator = 0
-    var bits = 0
-    var at = size - 1
-    var i = 0
-    while (at >= 0) {
-        while (bits < 8 && i < limbs.size) {
-            accumulator = accumulator | (limbs[i] << bits)
-            bits = bits + LIMB_BITS
-            i = i + 1
-        }
-        digits[at] = accumulator & 255
-        accumulator = accumulator >> 8
-        bits = if (bits >= 8) bits - 8 else 0
-        at = at - 1
-    }
-    pdfIntsToBytes(digits)
-}
-
-private fun compareLimbs(a: array<int>, b: array<int>): int {
-    var i = a.size - 1
-    while (i >= 0) {
-        val y = if (i < b.size) b[i] else 0
-        if (a[i] != y) return if (a[i] > y) 1 else -1
-        i = i - 1
-    }
-    0
-}
-
-private fun subtractInPlace(var a: array<int>, b: array<int>): void {
-    var borrow = 0
-    for (i in 0 until a.size) {
-        var v = a[i] - borrow - (if (i < b.size) b[i] else 0)
-        borrow = if (v < 0) 1 else 0
-        if (v < 0) v = v + (1 << LIMB_BITS)
-        a[i] = v
-    }
-    return
-}
-
-private class Modulus(val n: array<int>, val inverse: int, val rSquared: array<int>)
-
-private fun modulusFor(n: array<int>): Modulus {
-    // -n^-1 mod 2^28 by Newton's iteration.
-    val low = n[0]
-    var x = 1
-    for (i in 0 until 6) x = (x * (2 - low * x)) & LIMB_MASK
-    val inverse = (0 - x) & LIMB_MASK
-    // R^2 mod n by doubling, starting from 1.
-    val value = filledArray(n.size, 0)
-    value[0] = 1
-    for (i in 0 until 2 * n.size * LIMB_BITS) {
-        var carry = 0
-        for (k in 0 until value.size) {
-            val v = (value[k] << 1) | carry
-            value[k] = v & LIMB_MASK
-            carry = v >> LIMB_BITS
-        }
-        if (carry != 0 || compareLimbs(value, n) >= 0) subtractInPlace(value, n)
-    }
-    Modulus(n, inverse, value)
-}
-
-private fun montMul(a: array<int>, b: array<int>, m: Modulus): array<int> {
-    val n = m.n
-    val size = n.size
-    val t = filledArray(size + 2, 0)
-    for (i in 0 until size) {
-        var carry = 0
-        val bi = if (i < b.size) b[i] else 0
-        for (j in 0 until size) {
-            val v = t[j] + (if (j < a.size) a[j] else 0) * bi + carry
-            t[j] = v & LIMB_MASK
-            carry = v >> LIMB_BITS
-        }
-        var v = t[size] + carry
-        t[size] = v & LIMB_MASK
-        t[size + 1] = t[size + 1] + (v >> LIMB_BITS)
-        val q = (t[0] * m.inverse) & LIMB_MASK
-        v = t[0] + q * n[0]
-        carry = v >> LIMB_BITS
-        for (j in 1 until size) {
-            val w = t[j] + q * n[j] + carry
-            t[j - 1] = w & LIMB_MASK
-            carry = w >> LIMB_BITS
-        }
-        v = t[size] + carry
-        t[size - 1] = v & LIMB_MASK
-        t[size] = t[size + 1] + (v >> LIMB_BITS)
-        t[size + 1] = 0
-    }
-    val out = filledArray(size, 0)
-    for (i in 0 until size) out[i] = t[i]
-    if (t[size] != 0 || compareLimbs(out, n) >= 0) subtractInPlace(out, n)
-    out
-}
-
-// base^exponent mod the modulus, both byte strings, big-endian. The exponent is
-// walked square-and-multiply-always, which hides little: see PdfRsaSigner.
-private fun modPow(base: string, exponent: string, modulusBytes: string): string {
-    val n = limbsFromBytes(modulusBytes)
-    if (n.size == 0 || (n[0] & 1) == 0) return ""
-    val m = modulusFor(n)
-    val inMont = montMul(limbsFromBytes(base), m.rSquared, m)
-    val one = filledArray(n.size, 0)
-    one[0] = 1
-    var result = montMul(one, m.rSquared, m)
-    for (byte in exponent) {
-        var bit = 7
-        while (bit >= 0) {
-            result = montMul(result, result, m)
-            val multiplied = montMul(result, inMont, m)
-            if (((byte >> bit) & 1) == 1) result = multiplied
-            bit = bit - 1
-        }
-    }
-    bytesFromLimbs(montMul(result, one, m), modulusBytes.size)
-}
-
 private fun stripZeros(bytes: string): string {
     var i = 0
     while (i < bytes.size && bytes[i] == 0) i = i + 1
@@ -292,10 +149,12 @@ interface PdfSigner {
     fun sign(message: string): string
 }
 
-// RSA PKCS#1 v1.5 with SHA-256 on a key in memory, for tests and development.
-// This pure Abla code isn't hardened against timing or memory disclosure: keep
-// keys that matter in a device and implement PdfSigner over it.
-class PdfRsaSigner(val modulus: string, val exponent: string, val chain: array<string>) : PdfSigner {
+// RSA PKCS#1 v1.5 with SHA-256 on a key in memory, of 2048 bits or more, through
+// abla/crypto/rsa: blinded, in constant-time arithmetic, and checked before it's returned.
+// What that does and doesn't promise is in ablac's docs/stdlib/security-and-dates.md. The DER
+// it's read from is a string nothing wipes, so keep keys that matter in a device and
+// implement PdfSigner over it.
+class PdfRsaSigner(val keyDer: string, val chain: array<string>) : PdfSigner {
     fun certificates(): array<string> {
         val out: array<string> = []
         for (c in chain) out.append(c)
@@ -304,40 +163,23 @@ class PdfRsaSigner(val modulus: string, val exponent: string, val chain: array<s
 
     fun algorithmOid(): string = PDF_OID_RSA_SHA256
 
+    // The key is read for each signature, so its numbers are wiped from memory after it.
     fun sign(message: string): string {
-        val encoded = pkcs1Encode(PDF_OID_SHA256, sha256(message), modulus.size)
-        if (encoded == "") return ""
-        modPow(encoded, exponent, modulus)
+        val key = rsaPrivateKeyFromDer(keyDer)
+        val signed = key.signPkcs1Sha256(message)
+        if (signed.ok) signed.bytes else ""
     }
 }
 
-// Reads a private key in DER, PKCS#8 or PKCS#1. `ok` is false on anything else.
-class PdfRsaKey(val ok: bool, val modulus: string, val exponent: string)
+// Reads a private key in DER, PKCS#8 or PKCS#1, for PdfRsaSigner. `ok` is false on anything
+// else, or on a key under 2048 bits, with `error` saying why.
+class PdfRsaKey(val ok: bool, val error: string, val der: string)
 
 fun pdfParseRsaPrivateKey(der: string): PdfRsaKey {
-    val bad = PdfRsaKey(false, "", "")
-    val outer = derAt(der, 0, der.size)
-    if (outer.tag != 0x30) return bad
-    val version = derInside(der, outer)
-    if (version.tag != 2) return bad
-    val next = derNext(der, version, outer.end)
-    var sequence = der
-    var body = outer
-    if (next.tag == 0x30) {
-        // PKCS#8: the PKCS#1 key is an octet string after the algorithm.
-        val octets = derNext(der, next, outer.end)
-        if (octets.tag != 4) return bad
-        val inner = der.slice(octets.begin, octets.end)
-        sequence = inner
-        body = derAt(inner, 0, inner.size)
-        if (body.tag != 0x30) return bad
-    }
-    val v = derInside(sequence, body)
-    val n = derNext(sequence, v, body.end)
-    val e = derNext(sequence, n, body.end)
-    val d = derNext(sequence, e, body.end)
-    if (v.tag != 2 || n.tag != 2 || e.tag != 2 || d.tag != 2) return bad
-    PdfRsaKey(true, stripZeros(sequence.slice(n.begin, n.end)), stripZeros(sequence.slice(d.begin, d.end)))
+    val key = rsaPrivateKeyFromDer(der)
+    if (!key.ok()) return PdfRsaKey(false, key.error, "")
+    if (key.bits < 2048) return PdfRsaKey(false, "the key has ${key.bits} bits; signing needs 2048 or more", "")
+    PdfRsaKey(true, "", der)
 }
 
 // A DER body from PEM text; the first block when there are several.
@@ -887,7 +729,8 @@ private fun PdfReader.verifyOne(file: string, field: string, value: int): PdfSig
     if (hashOid == "" || certificate.rsaModulus == "") return fail(whole, true, certificate, "unsupported signature algorithm $algorithm")
     val payloadHash = digestByOid(hashOid, if (hasAttributes) signedPayload else signedBytes)
     val expected = pkcs1Encode(hashOid, payloadHash, certificate.rsaModulus.size)
-    val recovered = modPow(cms.slice(signatureValue.begin, signatureValue.end), certificate.rsaExponent, certificate.rsaModulus)
+    val publicKey = rsaPublicFromNumbers(certificate.rsaModulus, certificate.rsaExponent, "unreadable")
+    val recovered = if (publicKey.ok()) rsaPublicOperation(publicKey, cms.slice(signatureValue.begin, signatureValue.end)) else ""
     if (expected == "" || recovered != expected) return fail(whole, true, certificate, "the signature doesn't match the certificate")
     PdfSignatureInfo(field, sub, name, at, reason, true, true, whole, certificate, "")
 }

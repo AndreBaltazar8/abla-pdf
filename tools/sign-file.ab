@@ -11,10 +11,10 @@ fun derOf(text: string): string = if (text.contains("-----BEGIN")) pdfPemToDer(t
 fun main: int {
     val key = pdfParseRsaPrivateKey(derOf(path(processArgument(1)).readText()))
     if (!key.ok) {
-        eprintln("bad key")
+        eprintln("bad key: ${key.error}")
         return 2
     }
-    val signer = PdfRsaSigner(key.modulus, key.exponent, [derOf(path(processArgument(2)).readText())])
+    val signer = PdfRsaSigner(key.der, [derOf(path(processArgument(2)).readText())])
     val result = pdfSign(path(processArgument(0)).readText(), signer, PdfSignOptions(
         1767225600000, name = "Assinatura de Teste", reason = "Teste de integração", location = "Évora"
     ))

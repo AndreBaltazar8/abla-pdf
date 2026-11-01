@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Signs generated PDFs with a throwaway self-signed certificate made on the spot,
-# then checks the results with poppler's pdfsig, openssl cms, qpdf and pyHanko. This
+# then checks the results with poppler's pdfsig, openssl cms, qpdf and pyHanko, and has
+# openssl sign the same signed attributes to compare the signature's bytes. This
 # proves the file and CMS structure, not a qualified signature: a self-signed
 # certificate is nobody's identity.
 # Build build/sign-file from tools/sign-file.ab first, then run inside:
@@ -28,12 +29,19 @@ data = open(sys.argv[1], "rb").read()
 m = re.search(rb"/ByteRange \[0 (\d+)\s+(\d+)\s+(\d+)\s*\]", data)
 a, b, c = map(int, m.groups())
 open(sys.argv[2] + ".signed", "wb").write(data[:a] + data[b:b + c])
-open(sys.argv[2] + ".p7s", "wb").write(bytes.fromhex(data[a + 1:b - 1].decode().rstrip("0") + ("0" if len(data[a + 1:b - 1].decode().rstrip("0")) % 2 else "")))
+# The hole is padded with zeros, so the CMS ends where its own DER length says.
+der = bytes.fromhex(data[a + 1:b - 1].decode())
+assert der[0] == 0x30 and der[1] & 0x80
+count = der[1] & 0x7f
+open(sys.argv[2] + ".p7s", "wb").write(der[:2 + count + int.from_bytes(der[2:2 + count], "big")])
 PY
     openssl cms -verify -inform DER -binary -in "$work/$name.p7s" -content "$work/$name.signed" -noverify -out /dev/null 2>"$work/err" \
         || note "$name: openssl cms: $(cat "$work/err")"
     openssl cms -cmsout -print -inform DER -in "$work/$name.p7s" | grep -q "signingCertificateV2\|id-smime-aa-signingCertificateV2" \
         || note "$name: no signing-certificate-v2 attribute"
+    python3 -I tools/signature-bytes.py "$work/$name.p7s" "$work/$name.attrs" "$work/$name.sig" || note "$name: reading the CMS"
+    openssl dgst -sha256 -sign "$work/key.pem" -out "$work/$name.openssl-sig" "$work/$name.attrs" || note "$name: openssl sign"
+    cmp "$work/$name.sig" "$work/$name.openssl-sig" || note "$name: signature differs from openssl's"
     if python3 -c 'import pyhanko' 2>/dev/null; then
         python3 -I - "$out" "$work/cert.pem" <<'PY' || note "$name: pyHanko rejected it"
 import sys
@@ -53,5 +61,5 @@ PY
         echo "pyHanko not available, skipped"
     fi
 done
-[ $fail = 0 ] && echo "signatures passed: pdfsig, openssl cms, qpdf, pyHanko (self-signed, not qualified)"
+[ $fail = 0 ] && echo "signatures passed: pdfsig, openssl cms, qpdf, pyHanko, byte-identical to openssl's (self-signed, not qualified)"
 exit $fail

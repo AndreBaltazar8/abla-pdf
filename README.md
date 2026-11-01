@@ -82,7 +82,8 @@ that limit's panic unless you also raise it with `memorySetLimit`.
 update holding an invisible signature field and a CMS detached `ETSI.CAdES.detached`
 signature with SHA-256 and the signing-certificate-v2 attribute. `PdfSigner` is an
 interface, so the key can stay in a smart card or HSM; `PdfRsaSigner` signs with an RSA key
-in memory and is for tests and development, since it isn't hardened against timing.
+in memory, of 2048 bits or more, through ablac's `abla/crypto/rsa`, which blinds, works in
+constant-time arithmetic and checks each signature before returning it.
 
 `pdfVerifySignatures(file)` reports for each signature whether the byte ranges and digest
 hold, whether the RSA signature matches the certificate inside it, and whether the signed

@@ -7,16 +7,53 @@ import "abla/test"
 import "abla/fs"
 import "abla/bytes"
 import "abla/crypto"
+import "abla/process"
 import "../src/pdf.ab"
 
-// No private key belongs in this repository, so a stub proves the failure paths.
+// No private key belongs in this repository: one made by openssl when the test runs signs
+// below, and a stub proves the failure paths.
 class NoCertificates : PdfSigner {
     fun certificates(): array<string> = array<string>()
     fun algorithmOid(): string = PDF_OID_RSA_SHA256
     fun sign(message: string): string = "x"
 }
 
+fun signingWithAKey(): void {
+    val dir = "build/signature-test"
+    command("mkdir").argument("-p").argument(dir).run()
+    val keyPem = dir + "/key.pem"
+    val certPem = dir + "/cert.pem"
+    val smallPem = dir + "/small.pem"
+    val made = command("openssl").argument("genrsa").argument("-out").argument(keyPem).argument("2048").run()
+    if (!expect(made == 0, "openssl made a key")) return
+    command("openssl").argument("req").argument("-x509").argument("-new").argument("-key").argument(keyPem)
+        .argument("-subj").argument("/CN=abla-pdf TEST ONLY").argument("-days").argument("2").argument("-sha256").argument("-out").argument(certPem).run()
+    command("openssl").argument("genrsa").argument("-out").argument(smallPem).argument("1024").run()
+    val key = pdfParseRsaPrivateKey(pdfPemToDer(path(keyPem).readText()))
+    expect(key.ok, "a 2048-bit key is read: ${key.error}")
+    val small = pdfParseRsaPrivateKey(pdfPemToDer(path(smallPem).readText()))
+    expect(!small.ok && small.error.contains("1024"), "a 1024-bit key is refused")
+
+    val doc = PdfDocument()
+    doc.addPage(PdfPage())
+    val signer = PdfRsaSigner(key.der, [pdfPemToDer(path(certPem).readText())])
+    val signed = pdfSign(doc.toBytes(), signer, PdfSignOptions(1767225600000))
+    expect(signed.ok, "signed: ${signed.error}")
+    val checks = pdfVerifySignatures(signed.bytes)
+    expectEqual(checks.size, 1, "one signature made")
+    if (checks.size == 1) expect(checks[0].signatureValid && checks[0].digestValid && checks[0].coversWholeFile, "our signature verifies: ${checks[0].problem}")
+    // PKCS#1 v1.5 has no randomness, whatever the blinding does inside.
+    val again = pdfSign(doc.toBytes(), signer, PdfSignOptions(1767225600000))
+    expectEqual(again.bytes, signed.bytes, "the same bytes each time")
+
+    val noKey = pdfSign(doc.toBytes(), PdfRsaSigner("junk", signer.certificates()), PdfSignOptions(0))
+    expect(!noKey.ok, "a signer with a bad key fails")
+    command("rm").argument("-rf").argument(dir).run()
+    return
+}
+
 fun main: int {
+    signingWithAKey()
     val file = path("tests/fixtures/signed-sample.pdf").readText()
     val checks = pdfVerifySignatures(file)
     expectEqual(checks.size, 1, "one signature")

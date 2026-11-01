@@ -17,7 +17,7 @@ jobs:
           nix_path: nixpkgs=channel:nixos-unstable
       - uses: AndreBaltazar8/setup-abla@b21e1290aa49862e7bf187dc84b6b3511f4b571e # v1.0.0
         with:
-          version: '0.2.25'
+          version: '0.2.27'
       - name: Unit tests
         run: make test-in-shell COMPILER=ablac
       - name: Generated files through qpdf, poppler, ghostscript and veraPDF
