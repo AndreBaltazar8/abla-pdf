@@ -85,6 +85,20 @@ fun withContent(content: string, fontEntry: string = "/Encoding /WinAnsiEncoding
     "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica $fontEntry >>"
 ])
 
+// Filled upright rectangles, as barcodes drawn with vectors are: re, closed four-line subpaths, colours, q/Q and cm.
+fun fills(): void {
+    val r = pdfOpen(withContent("1 0 0 rg 0 g 10 10 5 5 re 20 10 5 5 re f q 2 0 0 2 100 100 cm 1 g 0 0 3 4 re f Q 0 0 0 1 k 30 30 m 30 35 l 35 35 l 35 30 l h f 0.5 g 40 40 m 45 45 l 40 45 l h f 50 50 5 5 re S 60 60 5 5 re n q 0 1 -1 0 0 0 cm 0 0 2 3 re f Q"))
+    expect(r.ok, "fills file opens")
+    val got = r.pageFills(0)
+    expectEqual(got.size, 5, "two re, a scaled one, a four-line square and a quarter-turned one; not a triangle or a stroke")
+    expect(got[0].x0 == 10.0 && got[0].y0 == 10.0 && got[0].x1 == 15.0 && got[0].y1 == 15.0 && got[0].lightness == 0.0, "the first, black")
+    expect(got[1].x0 == 20.0, "the second of the same path")
+    expect(got[2].x0 == 100.0 && got[2].y1 == 108.0 && got[2].x1 == 106.0 && got[2].lightness == 1.0, "through cm, white")
+    expect(got[3].x0 == 30.0 && got[3].y1 == 35.0 && got[3].lightness == 0.0 && pdfOpen(withContent("0 g q 1 g Q 1 1 1 1 re f")).pageFills(0)[0].lightness == 0.0, "lines round a square; CMYK black; Q gives the colour back")
+    expect(got[4].x0 == -3.0 && got[4].y1 == 2.0, "turned a quarter: ${got[4].x0} ${got[4].y0} ${got[4].x1} ${got[4].y1}")
+    return
+}
+
 fun handWritten(): void {
     val r = pdfOpen(withContent("BT /F1 12 Tf 14 TL 20 250 Td (First) Tj T* (Second) Tj (Third) ' [(Ke) 120 (rn) -300 (ed)] TJ ET"))
     expect(r.ok, "hand file opens")
@@ -159,6 +173,7 @@ fun main: int {
 
     generatedRoundTrips()
     handWritten()
+    fills()
     garbage()
     testsPassed()
 }

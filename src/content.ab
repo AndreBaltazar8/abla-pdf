@@ -53,7 +53,11 @@ class PdfImageData(
     val ok: bool
 )
 
-class PdfPageContent(val items: array<PdfTextItem>, val images: array<PdfImageRef>)
+// A filled area that is an upright rectangle on the page, in points from its bottom left corner, with the fill's
+// lightness from 0 (black) to 1 (white). Barcodes and QR codes drawn as vectors come out as these.
+class PdfFill(val x0: f64, val y0: f64, val x1: f64, val y1: f64, val lightness: f64)
+
+class PdfPageContent(val items: array<PdfTextItem>, val images: array<PdfImageRef>, val fills: array<PdfFill> = [])
 
 class PdfFontDecoder(
     val name: string,
@@ -85,7 +89,7 @@ private fun identity(): Mat = Mat(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 
 private class Saved(
     val ctm: Mat, val font: int, val size: f64, val charSpace: f64, val wordSpace: f64,
-    val hScale: f64, val leading: f64, val rise: f64, val mode: int
+    val hScale: f64, val leading: f64, val rise: f64, val mode: int, val lightness: f64
 )
 
 private class Interp(
@@ -103,7 +107,14 @@ private class Interp(
     val saved: array<Saved>,
     val items: array<PdfTextItem>,
     val images: array<PdfImageRef>,
-    var operators: int
+    var operators: int,
+    // The fill colour's lightness, the path's upright rectangles so far (four numbers each, page coordinates), the open
+    // subpath's points, and whether the path has anything else.
+    var lightness: f64,
+    val rects: array<f64>,
+    val points: array<f64>,
+    var curved: bool,
+    val fills: array<PdfFill>
 )
 
 private var GLYPH_LIST_READY = false
@@ -671,6 +682,59 @@ private fun PdfReader.doXObject(resources: int, name: string, var st: Interp, de
     return
 }
 
+private fun clampUnit(value: f64): f64 = if (value < 0.0) 0.0 else if (value > 1.0) 1.0 else value
+
+private fun endPath(var st: Interp): void {
+    st.rects.clear()
+    st.points.clear()
+    st.curved = false
+    return
+}
+
+// A rectangle in user space, kept when the page's transform leaves it upright.
+private fun pathRect(var st: Interp, x0: f64, y0: f64, x1: f64, y1: f64): void {
+    val m = st.ctm
+    if (st.rects.size >= 800000) return
+    // Straight, or turned a quarter: either way still upright.
+    if (!(near(m.b, 0.0) && near(m.c, 0.0)) && !(near(m.a, 0.0) && near(m.d, 0.0))) {
+        st.curved = true
+        return
+    }
+    val ax = m.a * x0 + m.c * y0 + m.e
+    val ay = m.b * x0 + m.d * y0 + m.f
+    val bx = m.a * x1 + m.c * y1 + m.e
+    val by = m.b * x1 + m.d * y1 + m.f
+    st.rects.append(if (ax < bx) ax else bx)
+    st.rects.append(if (ay < by) ay else by)
+    st.rects.append(if (ax < bx) bx else ax)
+    st.rects.append(if (ay < by) by else ay)
+    return
+}
+
+private fun pathPoint(var st: Interp, x: f64, y: f64): void {
+    if (st.points.size < 64) {
+        st.points.append(x)
+        st.points.append(y)
+    } else st.curved = true
+    return
+}
+
+private fun near(a: f64, b: f64): bool = a - b < 0.0001 && b - a < 0.0001
+
+// A subpath of straight lines that goes round an upright rectangle counts as one, as some writers draw each module so.
+private fun closeSubpath(var st: Interp): void {
+    val p = st.points
+    var count = p.size / 2
+    if (count >= 2 && near(p[0], p[p.size - 2]) && near(p[1], p[p.size - 1])) count = count - 1
+    if (count == 4) {
+        val upright = (near(p[0], p[2]) && near(p[3], p[5]) && near(p[4], p[6]) && near(p[7], p[1])) ||
+            (near(p[1], p[3]) && near(p[2], p[4]) && near(p[5], p[7]) && near(p[6], p[0]))
+        if (upright) pathRect(st, p[0], p[1], p[4], p[5]) else st.curved = true
+    } else if (count > 0) st.curved = true
+    st.points.clear()
+    return
+}
+
 // Runs a content stream, adding to st.items and st.images.
 private fun PdfReader.pdfRunContent(content: string, resources: int, var st: Interp, depth: int): void {
     val savedNumber = currentNumber
@@ -721,7 +785,7 @@ private fun PdfReader.runOperator(
         "q" -> {
             if (st.saved.size < 512) st.saved.append(Saved(
                 Mat(st.ctm.a, st.ctm.b, st.ctm.c, st.ctm.d, st.ctm.e, st.ctm.f),
-                st.font, st.size, st.charSpace, st.wordSpace, st.hScale, st.leading, st.rise, st.mode
+                st.font, st.size, st.charSpace, st.wordSpace, st.hScale, st.leading, st.rise, st.mode, st.lightness
             ))
         }
         "Q" -> {
@@ -737,6 +801,7 @@ private fun PdfReader.runOperator(
                 st.leading = s.leading
                 st.rise = s.rise
                 st.mode = s.mode
+                st.lightness = s.lightness
                 st.saved.truncate(count - 1)
             }
         }
@@ -800,6 +865,38 @@ private fun PdfReader.runOperator(
             if (operands.size >= 1) doXObject(resources, nameOf(operands[0]), st, depth)
         }
         "BI" -> inlineImage(lx, st)
+        "g" -> st.lightness = clampUnit(operand(operands, 0))
+        "rg" -> st.lightness = clampUnit(0.299 * operand(operands, 0) + 0.587 * operand(operands, 1) + 0.114 * operand(operands, 2))
+        "k" -> st.lightness = clampUnit((1.0 - operand(operands, 3)) * (1.0 - (0.299 * operand(operands, 0) + 0.587 * operand(operands, 1) + 0.114 * operand(operands, 2))))
+        "sc", "scn" -> {
+            // By how many numbers it has: gray, RGB or CMYK. A pattern's name leaves the colour as it was.
+            var numbers = 0
+            for (o in operands) if (kinds[o] == PDF_INT || kinds[o] == PDF_REAL) numbers = numbers + 1
+            if (numbers == 1) st.lightness = clampUnit(operand(operands, 0))
+            else if (numbers == 3) st.lightness = clampUnit(0.299 * operand(operands, 0) + 0.587 * operand(operands, 1) + 0.114 * operand(operands, 2))
+            else if (numbers == 4) st.lightness = clampUnit((1.0 - operand(operands, 3)) * (1.0 - (0.299 * operand(operands, 0) + 0.587 * operand(operands, 1) + 0.114 * operand(operands, 2))))
+        }
+        "re" -> {
+            closeSubpath(st)
+            pathRect(st, operand(operands, 0), operand(operands, 1), operand(operands, 0) + operand(operands, 2), operand(operands, 1) + operand(operands, 3))
+        }
+        "m" -> {
+            closeSubpath(st)
+            pathPoint(st, operand(operands, 0), operand(operands, 1))
+        }
+        "l" -> pathPoint(st, operand(operands, 0), operand(operands, 1))
+        "c", "v", "y" -> st.curved = true
+        "h" -> closeSubpath(st)
+        "f", "F", "f*", "B", "B*", "b", "b*" -> {
+            closeSubpath(st)
+            var i = 0
+            while (i + 3 < st.rects.size && st.fills.size < 200000) {
+                st.fills.append(PdfFill(st.rects[i], st.rects[i + 1], st.rects[i + 2], st.rects[i + 3], st.lightness))
+                i = i + 4
+            }
+            endPath(st)
+        }
+        "n", "S", "s" -> endPath(st)
         else -> {}
     }
     return
@@ -852,16 +949,24 @@ fun PdfReader.pageContent(index: int, annotations: bool = false): PdfPageContent
     val items: array<PdfTextItem> = []
     val images: array<PdfImageRef> = []
     if (index < 0 || index >= pages.size) return PdfPageContent(items, images)
-    val st = Interp(identity(), identity(), identity(), -1, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0, [], items, images, 0)
+    val st = Interp(identity(), identity(), identity(), -1, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0, [], items, images, 0, 0.0, [], [], false, [])
     pdfRunContent(pageContentBytes(index), resolve(pages[index].resources), st, 0)
     if (annotations) runAnnotationAppearances(index, resolve(pages[index].resources), st)
-    PdfPageContent(st.items, st.images)
+    PdfPageContent(st.items, st.images, st.fills)
 }
 
 fun PdfReader.pageTextItems(index: int, annotations: bool = false): array<PdfTextItem> {
     val content = pageContent(index, annotations)
     val out: array<PdfTextItem> = []
     for (item in content.items) out.append(item)
+    out
+}
+
+// The page's filled upright rectangles, in drawing order: a later one covers an earlier one.
+fun PdfReader.pageFills(index: int): array<PdfFill> {
+    val content = pageContent(index)
+    val out: array<PdfFill> = []
+    for (fill in content.fills) out.append(fill)
     out
 }
 

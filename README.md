@@ -64,6 +64,9 @@ says the cross-references had to be rebuilt by scanning.
   include what annotations show. Unicode comes from ToUnicode, the font's encoding and
   Differences, or the embedded TrueType cmap. CJK predefined CMaps other than the UCS-2
   and UTF-16 ones need a ToUnicode map, or give U+FFFD.
+- `pageFills(i)`: filled areas that are upright rectangles (`re`, or four straight lines round
+  one), in page coordinates with the fill's lightness from 0 to 1, in drawing order. Barcodes
+  and QR codes drawn as vectors come out as these; curves, strokes and other shapes don't.
 - `pageImages(i)` and `imageData`; `metadata()`, `xmpMetadata()`, `pdfParseDate`;
   `pageMediaBox`, `pageCropBox`, `pageRotation`, `pageCount`.
 - Encrypted files with the standard handler: RC4 40 and 128, AES-128, AES-256 (revisions 5
