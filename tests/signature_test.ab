@@ -18,6 +18,50 @@ class NoCertificates : PdfSigner {
     fun sign(message: string): string = "x"
 }
 
+// Both accepted key containers produce the same deterministic PKCS#1 v1.5
+// signature, including empty and binary messages. Blinding changes no bytes.
+fun signingParity(keyPem: string, dir: string): void {
+    val publicPem = dir + "/public.pem"
+    val exported = command("openssl").argument("pkey").argument("-in").argument(keyPem)
+        .argument("-pubout").argument("-out").argument(publicPem).run()
+    if (!expectEqual(exported, 0, "export RSA public key")) return
+    val messages = ["", "PDF RSA byte parity", "ação / Évora / €",
+        "\0\x01\x7f\x80\xff\0", path("tests/fixtures/signed-sample.pdf").readText()]
+    for (format in ["pkcs1", "pkcs8"]) {
+        val pem = dir + "/" + format + ".pem"
+        val converted = if (format == "pkcs1") {
+            command("openssl").argument("rsa").argument("-in").argument(keyPem)
+                .argument("-traditional").argument("-out").argument(pem).run()
+        } else {
+            command("openssl").argument("pkcs8").argument("-topk8").argument("-nocrypt")
+                .argument("-in").argument(keyPem).argument("-out").argument(pem).run()
+        }
+        if (!expectEqual(converted, 0, "$format conversion")) return
+        val key = pdfParseRsaPrivateKey(pdfPemToDer(path(pem).readText()))
+        if (!expect(key.ok, "$format key parses: ${key.error}")) return
+        val signer = PdfRsaSigner(key.der, [])
+        for (message in messages) {
+            val input = dir + "/message.bin"
+            val expected = dir + "/openssl.sig"
+            val actual = dir + "/pdf.sig"
+            expect(path(input).writeText(message), "write binary message")
+            val signed = command("openssl").argument("dgst").argument("-sha256")
+                .argument("-sign").argument(pem).argument("-out").argument(expected)
+                .argument(input).run()
+            if (!expectEqual(signed, 0, "$format openssl signing")) return
+            val signature = signer.sign(message)
+            expectEqual(signature, path(expected).readText(), "$format bytes match openssl")
+            expectEqual(signer.sign(message), signature, "$format blinding keeps bytes stable")
+            expect(path(actual).writeText(signature), "write raw signature")
+            val verified = command("openssl").argument("dgst").argument("-sha256")
+                .argument("-verify").argument(publicPem).argument("-signature")
+                .argument(actual).argument(input).run()
+            expectEqual(verified, 0, "$format openssl verifies")
+        }
+    }
+    return
+}
+
 fun signingWithAKey(): void {
     val dir = "build/signature-test"
     command("mkdir").argument("-p").argument(dir).run()
@@ -29,6 +73,7 @@ fun signingWithAKey(): void {
     command("openssl").argument("req").argument("-x509").argument("-new").argument("-key").argument(keyPem)
         .argument("-subj").argument("/CN=abla-pdf TEST ONLY").argument("-days").argument("2").argument("-sha256").argument("-out").argument(certPem).run()
     command("openssl").argument("genrsa").argument("-out").argument(smallPem).argument("1024").run()
+    signingParity(keyPem, dir)
     val key = pdfParseRsaPrivateKey(pdfPemToDer(path(keyPem).readText()))
     expect(key.ok, "a 2048-bit key is read: ${key.error}")
     val small = pdfParseRsaPrivateKey(pdfPemToDer(path(smallPem).readText()))
