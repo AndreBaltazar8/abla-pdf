@@ -67,6 +67,12 @@ says the cross-references had to be rebuilt by scanning.
 - `pageFills(i)`: filled areas that are upright rectangles (`re`, or four straight lines round
   one), in page coordinates with the fill's lightness from 0 to 1, in drawing order. Barcodes
   and QR codes drawn as vectors come out as these; curves, strokes and other shapes don't.
+- `pageContent(i).paths`: every filled path of any shape (curves cut into lines), in page
+  coordinates, with its fill rule and lightness. `pageRaster(i, scale, maxPixels)`: the crop
+  box as gray pixels at `scale` pixels to the point, its raw images drawn into their boxes and
+  then its filled paths (nonzero or even-odd); text, strokes, clipping and JPEG or other coded
+  images are left out. For reading a code drawn as outlines, turned or of dots. `imageGray`
+  gives one raw image's samples as gray.
 - `pageImages(i)` and `imageData`; `metadata()`, `xmpMetadata()`, `pdfParseDate`;
   `pageMediaBox`, `pageCropBox`, `pageRotation`, `pageCount`.
 - Encrypted files with the standard handler: RC4 40 and 128, AES-128, AES-256 (revisions 5

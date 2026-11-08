@@ -1,0 +1,115 @@
+// A page as gray pixels (pageRaster): filled paths of any shape with both fill rules, curves, transforms, raw images in their
+// boxes, and what it leaves out. Pages here are 300 points square, rastered at one pixel to the point unless said otherwise.
+
+import "abla/test"
+import "abla/bytes"
+import "abla/text"
+import "../src/pdf.ab"
+
+fun oneObjectFile(objects: array<string>): string {
+    val out = byteBuffer()
+    out.appendText("%PDF-1.4\n")
+    val offsets: array<int> = []
+    for (i in 0 until objects.size) {
+        offsets.append(out.size())
+        out.appendText("${i + 1} 0 obj\n${objects[i]}\nendobj\n")
+    }
+    val at = out.size()
+    out.appendText("xref\n0 ${objects.size + 1}\n0000000000 65535 f \n")
+    for (o in offsets) out.appendText("${"$o".padStart(10, "0")} 00000 n \n")
+    out.appendText("trailer\n<< /Size ${objects.size + 1} /Root 1 0 R >>\nstartxref\n$at\n%%EOF\n")
+    out.toText()
+}
+
+fun withContent(content: string): string = oneObjectFile([
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 300] >>",
+    "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+    "<< /Length ${content.size} >>\nstream\n$content\nendstream"
+])
+
+// The pixel over page point (x, y) at one pixel to the point: rows go down from the top.
+fun at(raster: PdfRaster, x: int, y: int): int = int(raster.pixels[(raster.height - 1 - y) * raster.width + x])
+
+fun shapes(): void {
+    val r = pdfOpen(withContent(
+        "0 g 10 10 m 50 10 l 10 50 l h f " +
+        "100 100 m 160 100 l 160 160 l 100 160 l h 120 120 m 140 120 l 140 140 l 120 140 l h f " +
+        "100 20 m 160 20 l 160 80 l 100 80 l h 120 40 m 140 40 l 140 60 l 120 60 l h f* " +
+        "0.5 g 220 220 m 220 231 211 240 200 240 c 189 240 180 231 180 220 c 180 209 189 200 200 200 c 211 200 220 209 220 220 c f " +
+        "0 g 200 30 m 280 30 l S " +
+        "q 0.7071 0.7071 -0.7071 0.7071 60 200 cm 0 0 30 30 re f Q"
+    ))
+    expect(r.ok, "shapes file opens")
+    val content = r.pageContent(0)
+    expectEqual(content.paths.size, 5, "a triangle, two nested squares twice, a circle and a turned square; not the stroke")
+    expect(content.paths[2].evenOdd && !content.paths[1].evenOdd, "the fill rule is kept")
+    val raster = r.pageRaster(0, 1.0, 1000000)
+    if (raster == null) {
+        expect(false, "the page rasters")
+        return
+    }
+    expect(raster.width == 300 && raster.height == 300, "one pixel to the point: ${raster.width}x${raster.height}")
+    expectEqual(at(raster, 15, 15), 0, "inside the triangle, black")
+    expectEqual(at(raster, 45, 45), 255, "past its long side, white")
+    expectEqual(at(raster, 110, 110), 0, "the outer square")
+    expectEqual(at(raster, 130, 130), 0, "nonzero: an inner square going the same way is filled")
+    expectEqual(at(raster, 110, 30), 0, "even-odd: the outer square")
+    expectEqual(at(raster, 130, 50), 255, "even-odd: the inner square is a hole")
+    expectEqual(at(raster, 200, 220), 128, "the circle's middle, in its gray")
+    expectEqual(at(raster, 184, 204), 255, "outside the circle, past its curve")
+    expectEqual(at(raster, 240, 30), 255, "a stroke isn't filled")
+    expectEqual(at(raster, 60, 220), 0, "the turned square's middle")
+    expectEqual(at(raster, 80, 205), 255, "beside the turned square, where its upright box would be")
+    return
+}
+
+fun images(): void {
+    val doc = PdfDocument()
+    val page = PdfPage()
+    // 2 x 2 gray: black, white over white, black.
+    val image = doc.addRawImage(2, 2, 1, pdfIntsToBytes([0, 255, 255, 0]))
+    expect(image.ok, "raw image: ${image.error}")
+    page.image(image, 100.0, 100.0, 40.0, 40.0)
+    page.setFillGray(0.0)
+    page.rect(100.0, 100.0, 10.0, 10.0)
+    page.fill()
+    doc.addPage(page)
+    val r = pdfOpen(doc.toBytes())
+    expect(r.ok, "image file opens: ${r.error}")
+    val raster = r.pageRaster(0, 1.0, 2000000)
+    if (raster == null) {
+        expect(false, "the image page rasters")
+        return
+    }
+    expectEqual(at(raster, 105, 135), 0, "the image's top left, black")
+    expectEqual(at(raster, 135, 135), 255, "its top right, white")
+    expectEqual(at(raster, 115, 115), 255, "its bottom left, white, outside the square drawn over it")
+    expectEqual(at(raster, 105, 105), 0, "the square drawn after it, over it")
+    expectEqual(at(raster, 135, 105), 0, "its bottom right, black")
+    expectEqual(at(raster, 150, 150), 255, "outside it, white")
+    return
+}
+
+fun scaleAndLimits(): void {
+    val r = pdfOpen(withContent("0 g 10 10 m 20 10 l 20 20 l 10 20 l h f"))
+    val twice = r.pageRaster(0, 2.0, 1000000)
+    if (twice == null) {
+        expect(false, "rasters at twice the size")
+        return
+    }
+    expect(twice.width == 600 && twice.height == 600, "two pixels to the point")
+    expectEqual(int(twice.pixels[(600 - 1 - 30) * 600 + 30]), 0, "the square at twice the size")
+    expectEqual(int(twice.pixels[(600 - 1 - 42) * 600 + 42]), 255, "and only that")
+    expect(r.pageRaster(0, 1.0, 1000) == null, "larger than the limit: none")
+    expect(r.pageRaster(3, 1.0, 1000000) == null, "no such page: none")
+    expect(r.pageRaster(0, 0.0, 1000000) == null, "no scale: none")
+    return
+}
+
+fun main: int {
+    shapes()
+    images()
+    scaleAndLimits()
+    testsPassed()
+}

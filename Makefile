@@ -1,6 +1,6 @@
 ABLAC_DIR ?= $(abspath ../ablac)
 COMPILER ?= $(ABLAC_DIR)/build/ablac
-TESTS := tests/flate_test.ab tests/crypt_test.ab tests/writer_test.ab tests/reader_test.ab tests/signature_test.ab
+TESTS := tests/flate_test.ab tests/crypt_test.ab tests/writer_test.ab tests/reader_test.ab tests/raster_test.ab tests/signature_test.ab
 TOOLS := nix-shell -p qpdf poppler-utils verapdf ghostscript
 
 .PHONY: test test-in-shell external corpus signatures clean

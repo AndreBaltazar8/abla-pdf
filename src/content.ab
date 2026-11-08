@@ -57,7 +57,11 @@ class PdfImageData(
 // lightness from 0 (black) to 1 (white). Barcodes and QR codes drawn as vectors come out as these.
 class PdfFill(val x0: f64, val y0: f64, val x1: f64, val y1: f64, val lightness: f64)
 
-class PdfPageContent(val items: array<PdfTextItem>, val images: array<PdfImageRef>, val fills: array<PdfFill> = [])
+// A filled path of any shape, in page points: its subpaths' corners (x, y pairs; curves cut into lines), where each subpath
+// starts in `points` (an index of an x), the fill rule and the fill's lightness. A QR code drawn as one outline comes out as this.
+class PdfPath(val points: array<f64>, val starts: array<int>, val evenOdd: bool, val lightness: f64)
+
+class PdfPageContent(val items: array<PdfTextItem>, val images: array<PdfImageRef>, val fills: array<PdfFill> = [], val paths: array<PdfPath> = [])
 
 class PdfFontDecoder(
     val name: string,
@@ -114,7 +118,14 @@ private class Interp(
     val rects: array<f64>,
     val points: array<f64>,
     var curved: bool,
-    val fills: array<PdfFill>
+    val fills: array<PdfFill>,
+    // The path of any shape so far, in page coordinates (subpath starts in polyStarts), the current point in user space, and
+    // the filled paths.
+    val poly: array<f64>,
+    val polyStarts: array<int>,
+    var curX: f64,
+    var curY: f64,
+    val paths: array<PdfPath>
 )
 
 private var GLYPH_LIST_READY = false
@@ -687,6 +698,8 @@ private fun clampUnit(value: f64): f64 = if (value < 0.0) 0.0 else if (value > 1
 private fun endPath(var st: Interp): void {
     st.rects.clear()
     st.points.clear()
+    st.poly.clear()
+    st.polyStarts.clear()
     st.curved = false
     return
 }
@@ -720,6 +733,67 @@ private fun pathPoint(var st: Interp, x: f64, y: f64): void {
 }
 
 private fun near(a: f64, b: f64): bool = a - b < 0.0001 && b - a < 0.0001
+
+// Every filled path keeps at most this many numbers in all, and one path this many: enough for a page of QR modules.
+private val POLY_TOTAL = 4000000
+private val POLY_ONE = 400000
+
+private fun polyMove(var st: Interp, x: f64, y: f64): void {
+    st.curX = x
+    st.curY = y
+    if (st.poly.size >= POLY_ONE) return
+    st.polyStarts.append(st.poly.size)
+    val m = st.ctm
+    st.poly.append(m.a * x + m.c * y + m.e)
+    st.poly.append(m.b * x + m.d * y + m.f)
+    return
+}
+
+private fun polyLine(var st: Interp, x: f64, y: f64): void {
+    st.curX = x
+    st.curY = y
+    // A line with no subpath before it starts one where it is.
+    if (st.polyStarts.size == 0) {
+        polyMove(st, x, y)
+        return
+    }
+    if (st.poly.size >= POLY_ONE) return
+    val m = st.ctm
+    st.poly.append(m.a * x + m.c * y + m.e)
+    st.poly.append(m.b * x + m.d * y + m.f)
+    return
+}
+
+// A cubic Bézier from the current point, cut into 8 lines: fine for a filled shape's edge at the sizes a code is read at.
+private fun polyCurve(var st: Interp, x1: f64, y1: f64, x2: f64, y2: f64, x3: f64, y3: f64): void {
+    val x0 = st.curX
+    val y0 = st.curY
+    var i = 1
+    while (i <= 8) {
+        val t = f64FromInt(i) / 8.0
+        val u = 1.0 - t
+        val x = u * u * u * x0 + 3.0 * u * u * t * x1 + 3.0 * u * t * t * x2 + t * t * t * x3
+        val y = u * u * u * y0 + 3.0 * u * u * t * y1 + 3.0 * u * t * t * y2 + t * t * t * y3
+        polyLine(st, x, y)
+        i = i + 1
+    }
+    st.curX = x3
+    st.curY = y3
+    return
+}
+
+private fun polyFill(var st: Interp, evenOdd: bool): void {
+    if (st.poly.size < 6) return
+    var total = 0
+    for (p in st.paths) total = total + p.points.size
+    if (total + st.poly.size > POLY_TOTAL) return
+    val points: array<f64> = []
+    for (v in st.poly) points.append(v)
+    val starts: array<int> = []
+    for (v in st.polyStarts) starts.append(v)
+    st.paths.append(PdfPath(points, starts, evenOdd, st.lightness))
+    return
+}
 
 // A subpath of straight lines that goes round an upright rectangle counts as one, as some writers draw each module so.
 private fun closeSubpath(var st: Interp): void {
@@ -878,14 +952,38 @@ private fun PdfReader.runOperator(
         }
         "re" -> {
             closeSubpath(st)
-            pathRect(st, operand(operands, 0), operand(operands, 1), operand(operands, 0) + operand(operands, 2), operand(operands, 1) + operand(operands, 3))
+            val x = operand(operands, 0)
+            val y = operand(operands, 1)
+            val w = operand(operands, 2)
+            val h = operand(operands, 3)
+            pathRect(st, x, y, x + w, y + h)
+            polyMove(st, x, y)
+            polyLine(st, x + w, y)
+            polyLine(st, x + w, y + h)
+            polyLine(st, x, y + h)
+            polyLine(st, x, y)
         }
         "m" -> {
             closeSubpath(st)
             pathPoint(st, operand(operands, 0), operand(operands, 1))
+            polyMove(st, operand(operands, 0), operand(operands, 1))
         }
-        "l" -> pathPoint(st, operand(operands, 0), operand(operands, 1))
-        "c", "v", "y" -> st.curved = true
+        "l" -> {
+            pathPoint(st, operand(operands, 0), operand(operands, 1))
+            polyLine(st, operand(operands, 0), operand(operands, 1))
+        }
+        "c" -> {
+            st.curved = true
+            polyCurve(st, operand(operands, 0), operand(operands, 1), operand(operands, 2), operand(operands, 3), operand(operands, 4), operand(operands, 5))
+        }
+        "v" -> {
+            st.curved = true
+            polyCurve(st, st.curX, st.curY, operand(operands, 0), operand(operands, 1), operand(operands, 2), operand(operands, 3))
+        }
+        "y" -> {
+            st.curved = true
+            polyCurve(st, operand(operands, 0), operand(operands, 1), operand(operands, 2), operand(operands, 3), operand(operands, 2), operand(operands, 3))
+        }
         "h" -> closeSubpath(st)
         "f", "F", "f*", "B", "B*", "b", "b*" -> {
             closeSubpath(st)
@@ -894,6 +992,7 @@ private fun PdfReader.runOperator(
                 st.fills.append(PdfFill(st.rects[i], st.rects[i + 1], st.rects[i + 2], st.rects[i + 3], st.lightness))
                 i = i + 4
             }
+            polyFill(st, word == "f*" || word == "B*" || word == "b*")
             endPath(st)
         }
         "n", "S", "s" -> endPath(st)
@@ -949,10 +1048,10 @@ fun PdfReader.pageContent(index: int, annotations: bool = false): PdfPageContent
     val items: array<PdfTextItem> = []
     val images: array<PdfImageRef> = []
     if (index < 0 || index >= pages.size) return PdfPageContent(items, images)
-    val st = Interp(identity(), identity(), identity(), -1, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0, [], items, images, 0, 0.0, [], [], false, [])
+    val st = Interp(identity(), identity(), identity(), -1, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0, [], items, images, 0, 0.0, [], [], false, [], [], [], 0.0, 0.0, [])
     pdfRunContent(pageContentBytes(index), resolve(pages[index].resources), st, 0)
     if (annotations) runAnnotationAppearances(index, resolve(pages[index].resources), st)
-    PdfPageContent(st.items, st.images, st.fills)
+    PdfPageContent(st.items, st.images, st.fills, st.paths)
 }
 
 fun PdfReader.pageTextItems(index: int, annotations: bool = false): array<PdfTextItem> {

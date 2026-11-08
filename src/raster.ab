@@ -1,0 +1,190 @@
+// A page drawn as gray pixels, for reading what it shows as a picture, such as a QR code: its filled paths of any shape and
+// its images with raw samples, each into its box. Text, strokes, clipping and JPEG or other coded images are left out.
+
+import "util.ab"
+import "reader.ab"
+import "content.ab"
+import "document.ab"
+import "abla/float"
+import "abla/math"
+
+class PdfRaster(val width: int, val height: int, val pixels: array<u8>)
+
+// An image's samples as gray, 0 black to 255 white, row by row from the top; null for a coded image (JPEG and the like) or one
+// whose data doesn't fit its size. A stencil mask is black where it paints; CMYK is ink.
+fun PdfReader.imageGray(ref: PdfImageRef, maxPixels: int): PdfRaster? {
+    val w = ref.width
+    val h = ref.height
+    if (w <= 0 || h <= 0 || w * h > maxPixels) return null
+    val data = imageData(ref)
+    if (!data.ok || data.encoding != "raw") return null
+    val bits = if (ref.isMask) 1 else ref.bitsPerComponent
+    if (bits != 1 && bits != 2 && bits != 4 && bits != 8) return null
+    // Components by the data's size: a colour space's name doesn't say how many an ICC profile has.
+    var components = 1
+    while (components < 4 && (w * components * bits + 7) / 8 * h < data.data.size) components = components + 1
+    val row = (w * components * bits + 7) / 8
+    if (row * h > data.data.size) return null
+    val top = (1 << bits) - 1
+    val gray = filledArray(w * h, u8(0))
+    var y = 0
+    while (y < h) {
+        var x = 0
+        while (x < w) {
+            var sum = 0
+            var c = 0
+            while (c < components) {
+                val at = (x * components + c) * bits
+                val byte = data.data[y * row + at / 8]
+                sum = sum + ((byte >> (8 - bits - at % 8)) & top) * 255 / top
+                c = c + 1
+            }
+            var value = sum / components
+            if (ref.isMask) value = if (value == 0) 0 else 255
+            else if (components == 4) value = 255 - value
+            gray[y * w + x] = u8(value)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    PdfRaster(w, h, gray)
+}
+
+// The page's crop box at `scale` pixels to the point (200 dpi is 200.0 / 72.0), white where nothing is drawn: first its images,
+// then its filled paths in drawing order, a later one over an earlier one. Null when it would be more than `maxPixels`.
+fun PdfReader.pageRaster(index: int, scale: f64, maxPixels: int): PdfRaster? {
+    if (index < 0 || index >= pageCount() || scale <= 0.0) return null
+    val box = pageCropBox(index)
+    val w = f64ToInt(ceil((box.right - box.left) * scale))
+    val h = f64ToInt(ceil((box.top - box.bottom) * scale))
+    if (w <= 0 || h <= 0 || w * h > maxPixels) return null
+    val pixels = filledArray(w * h, u8(255))
+    val content = pageContent(index)
+    for (ref in content.images) {
+        val image = imageGray(ref, maxPixels)
+        if (image == null) continue
+        rasterImage(pixels, w, h, box, scale, ref, image)
+    }
+    for (path in content.paths) rasterPath(pixels, w, h, box, scale, path)
+    PdfRaster(w, h, pixels)
+}
+
+// Nearest sample into the image's box; the image's first row is its top.
+private fun rasterImage(var pixels: array<u8>, w: int, h: int, box: PdfRect, scale: f64, ref: PdfImageRef, image: PdfRaster): void {
+    val left = if (ref.drawWidth < 0.0) ref.x + ref.drawWidth else ref.x
+    val bottom = if (ref.drawHeight < 0.0) ref.y + ref.drawHeight else ref.y
+    val width = if (ref.drawWidth < 0.0) 0.0 - ref.drawWidth else ref.drawWidth
+    val height = if (ref.drawHeight < 0.0) 0.0 - ref.drawHeight else ref.drawHeight
+    if (width <= 0.0 || height <= 0.0) return
+    val px0 = clampInt(f64ToInt(floor((left - box.left) * scale)), 0, w)
+    val px1 = clampInt(f64ToInt(ceil((left + width - box.left) * scale)), 0, w)
+    val py0 = clampInt(f64ToInt(floor((box.top - (bottom + height)) * scale)), 0, h)
+    val py1 = clampInt(f64ToInt(ceil((box.top - bottom) * scale)), 0, h)
+    var y = py0
+    while (y < py1) {
+        // The pixel's centre, as a fraction down the image.
+        val down = ((f64FromInt(y) + 0.5) / scale - (box.top - (bottom + height))) / height
+        val sy = clampInt(f64ToInt(down * f64FromInt(image.height)), 0, image.height - 1)
+        var x = px0
+        while (x < px1) {
+            val across = ((f64FromInt(x) + 0.5) / scale - (left - box.left)) / width
+            val sx = clampInt(f64ToInt(across * f64FromInt(image.width)), 0, image.width - 1)
+            pixels[y * w + x] = image.pixels[sy * image.width + sx]
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return
+}
+
+// Scanline fill at pixel centres: each row's crossings with the path's edges, sorted, and the spans the fill rule paints.
+private fun rasterPath(var pixels: array<u8>, w: int, h: int, box: PdfRect, scale: f64, path: PdfPath): void {
+    // The edges in pixels: x0, y0, x1, y1 each, every subpath closed.
+    val edges: array<f64> = []
+    var top = f64FromInt(h)
+    var bottom = 0.0
+    var s = 0
+    while (s < path.starts.size) {
+        val from = path.starts[s]
+        val to = if (s + 1 < path.starts.size) path.starts[s + 1] else path.points.size
+        var i = from
+        while (i + 1 < to) {
+            val j = if (i + 3 < to) i + 2 else from
+            val ax = (path.points[i] - box.left) * scale
+            val ay = (box.top - path.points[i + 1]) * scale
+            val bx = (path.points[j] - box.left) * scale
+            val by = (box.top - path.points[j + 1]) * scale
+            if (ay != by) {
+                edges.append(ax)
+                edges.append(ay)
+                edges.append(bx)
+                edges.append(by)
+                if (ay < top) top = ay
+                if (by < top) top = by
+                if (ay > bottom) bottom = ay
+                if (by > bottom) bottom = by
+            }
+            i = i + 2
+        }
+        s = s + 1
+    }
+    if (edges.size == 0) return
+    val value = u8(clampInt(f64ToInt(path.lightness * 255.0 + 0.5), 0, 255))
+    val y0 = clampInt(f64ToInt(floor(top)), 0, h)
+    val y1 = clampInt(f64ToInt(ceil(bottom)), 0, h)
+    val crossings: array<f64> = []
+    val windings: array<int> = []
+    var y = y0
+    while (y < y1) {
+        val cy = f64FromInt(y) + 0.5
+        crossings.clear()
+        windings.clear()
+        var e = 0
+        while (e + 3 < edges.size) {
+            val ax = edges[e]
+            val ay = edges[e + 1]
+            val bx = edges[e + 2]
+            val by = edges[e + 3]
+            // Half-open in y, so a corner shared by two edges counts once.
+            val down = ay < by
+            val lo = if (down) ay else by
+            val hi = if (down) by else ay
+            if (cy >= lo && cy < hi) {
+                val x = ax + (cy - ay) * (bx - ax) / (by - ay)
+                // Insertion into order: rows cross few edges.
+                var at = crossings.size
+                crossings.append(x)
+                windings.append(if (down) 1 else -1)
+                while (at > 0 && crossings[at - 1] > x) {
+                    crossings[at] = crossings[at - 1]
+                    windings[at] = windings[at - 1]
+                    at = at - 1
+                }
+                crossings[at] = x
+                windings[at] = if (down) 1 else -1
+            }
+            e = e + 4
+        }
+        var winding = 0
+        var k = 0
+        while (k + 1 < crossings.size) {
+            winding = winding + windings[k]
+            val inside = if (path.evenOdd) (k % 2) == 0 else winding != 0
+            if (inside) {
+                // Pixels whose centre lies within the span.
+                val x0 = clampInt(f64ToInt(ceil(crossings[k] - 0.5)), 0, w)
+                val x1 = clampInt(f64ToInt(ceil(crossings[k + 1] - 0.5)), 0, w)
+                var x = x0
+                while (x < x1) {
+                    pixels[y * w + x] = value
+                    x = x + 1
+                }
+            }
+            k = k + 1
+        }
+        y = y + 1
+    }
+    return
+}
+
+private fun clampInt(value: int, lo: int, hi: int): int = if (value < lo) lo else if (value > hi) hi else value
