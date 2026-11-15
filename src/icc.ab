@@ -6,6 +6,7 @@ import "util.ab"
 import "abla/bytes"
 import "abla/float"
 import "abla/math"
+import "abla/text"
 
 private fun s15(value: f64): int = f64ToInt(floor(value * 65536.0 + 0.5))
 

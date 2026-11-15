@@ -5,6 +5,7 @@
 import "util.ab"
 import "abla/bytes"
 import "abla/crypto"
+import "abla/text"
 
 fun pdfRc4(key: string, data: string): string {
     if (key.size == 0) return data
