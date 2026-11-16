@@ -8,6 +8,7 @@ import "abla/fs"
 import "abla/bytes"
 import "abla/crypto"
 import "abla/process"
+import "abla/text"
 import "../src/pdf.ab"
 
 // No private key belongs in this repository: one made by openssl when the test runs signs

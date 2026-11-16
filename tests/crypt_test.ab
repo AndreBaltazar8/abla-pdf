@@ -1,5 +1,6 @@
 import "abla/test"
 import "abla/crypto"
+import "abla/text"
 import "../src/pdf.ab"
 
 fun main: int {
