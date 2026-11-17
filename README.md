@@ -108,10 +108,10 @@ visible signature appearances, signing encrypted files, verifying ECDSA signatur
 ## Testing
 
 `make test` runs the unit tests. `make external` puts generated files through qpdf,
-poppler, ghostscript and veraPDF (PDF/A-2b). `make corpus` generates PDFs with cairo,
-reportlab, ghostscript, qpdf, pypdf and poppler, plus hand-written damaged and hostile
-ones, compares the reader with poppler and pypdf on them, then fuzzes. `make signatures`
-signs with a throwaway certificate and checks with pdfsig, openssl cms, qpdf and pyHanko.
+poppler, ghostscript and veraPDF (PDF/A-2b). `make corpus` runs the reader over the committed corpus of PDFs from other
+producers (cairo, reportlab, ghostscript, qpdf, pypdf and poppler, plus hand-written damaged and hostile ones; tests/corpus/README.md
+says how it was made), compares it with poppler and pypdf, then fuzzes. `make signatures`
+signs with a throwaway certificate and checks with pdfsig, openssl cms, qpdf and tools/signature-parts.ab, and refuses damaged copies.
 All through nix. `tests/fuzz_test.ab` takes a first seed, a seed count and a directory for
 longer runs, leaving the input of a crash in `build/fuzz-last.pdf`, and `tools/read-file.ab`
 reads one file completely to reproduce it.

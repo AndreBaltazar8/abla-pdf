@@ -102,7 +102,7 @@ fun main: int {
     val firstSeed = if (processArgumentCount() > 0) seedArg(processArgument(0)) else 1
     val seeds = if (processArgumentCount() > 1) seedArg(processArgument(1)) else 1500
     val inputs = [sampleFile(true, false), sampleFile(false, false), sampleFile(true, true), sampleFile(false, true)]
-    val corpus = path(if (processArgumentCount() > 2) processArgument(2) else "tests/corpus/generated")
+    val corpus = path(if (processArgumentCount() > 2) processArgument(2) else "tests/corpus/files")
     if (corpus.exists()) {
         for (entry in corpus.entries()) {
             val small = entry.info().size < 200000

@@ -1,5 +1,5 @@
 // Compares PNG decoding with what Pillow reads from the same files, which
-// tools/test-corpus.sh generates, and checks JPEG headers. Skipped when not generated.
+// tests/corpus/files has, and checks JPEG headers.
 
 import "abla/test"
 import "abla/io"
@@ -28,9 +28,9 @@ fun checkPng(dir: string, name: string): void {
 }
 
 fun main: int {
-    val dir = "tests/corpus/generated/images"
+    val dir = "tests/corpus/files/images"
     if (!path(dir).exists()) {
-        println("images not generated, skipped: run tools/test-corpus.sh")
+        println("images missing, skipped")
         return testsPassed()
     }
     for (name in ["rgb", "rgba", "gray", "gray-alpha", "palette", "one-bit", "gray16", "interlaced"]) checkPng(dir, name)

@@ -22,10 +22,10 @@ corpus:
 	tools/test-corpus.sh
 	nix-shell $(ABLAC_DIR)/shell.nix --run '$(COMPILER) test tests/corpus_test.ab tests/image_test.ab tests/fuzz_test.ab'
 
-# Signatures with a throwaway certificate, checked by pdfsig, openssl and pyHanko.
+# Signatures with a throwaway certificate, checked by pdfsig, openssl, qpdf and tools/signature-parts.ab.
 signatures: test
-	nix-shell $(ABLAC_DIR)/shell.nix --run '$(COMPILER) build tools/sign-file.ab -o build/sign-file'
-	nix-shell -p openssl qpdf poppler-utils 'python3.withPackages(p: [p.pyhanko p.pyhanko-certvalidator])' --run tools/test-signatures.sh
+	nix-shell $(ABLAC_DIR)/shell.nix --run '$(COMPILER) build tools/sign-file.ab -o build/sign-file && $(COMPILER) build tools/signature-parts.ab -o build/signature-parts'
+	nix-shell -p openssl qpdf poppler-utils --run tools/test-signatures.sh
 
 clean:
-	rm -rf build tests/corpus/generated
+	rm -rf build tests/corpus/files/hostile-many-values.pdf

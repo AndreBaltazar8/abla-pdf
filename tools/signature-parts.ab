@@ -1,0 +1,150 @@
+// Takes a signed PDF apart for tools/test-signatures.sh, by its own reading of the file (nothing of src/ is used, so a
+// fault in the library cannot hide in both):
+//
+//   signature-parts signed.pdf prefix
+//
+// Writes prefix.signed (the bytes the ByteRange covers), prefix.p7s (the CMS SignedData, cut where its own DER length ends:
+// the Contents hole is padded with zeros), prefix.attrs (the signed attributes as they are signed, with their SET tag in place
+// of the [0] they carry in the CMS) and prefix.sig (the signature value). Exit status: 0 for a signature that covers the whole
+// file; 10 when it covers only the start (bytes follow the signed ranges: an unsigned incremental update); 11 when the
+// ByteRange is not [0 a b c] with the gap [a, b) exactly the `<hex>` string of /Contents; 12 when no CMS can be read.
+import "abla/crypto"
+import "abla/fs"
+import "abla/io"
+import "abla/process"
+import "abla/text"
+
+class DerItem(val tag: int, val start: int, val bodyBegin: int, val bodyEnd: int)
+
+// The items of data[at, end): tag, then a short or long form length.
+fun derItems(data: string, begin: int, end: int): array<DerItem> {
+    val items: array<DerItem> = []
+    var at = begin
+    var ok = true
+    while (ok && at < end) {
+        if (at + 2 > end) {
+            ok = false
+        } else {
+            val tag = data[at]
+            var length = data[at + 1]
+            var head = 2
+            if (length >= 128) {
+                val count = length - 128
+                if (count == 0 || count > 4 || at + 2 + count > end) {
+                    ok = false
+                } else {
+                    length = 0
+                    for (i in 0 until count) length = length * 256 + data[at + 2 + i]
+                    head = 2 + count
+                }
+            }
+            if (ok) {
+                if (at + head + length > end) {
+                    ok = false
+                } else {
+                    items.append(DerItem(tag, at, at + head, at + head + length))
+                    at = at + head + length
+                }
+            }
+        }
+    }
+    if (!ok) items.clear()
+    items
+}
+
+fun firstWithTag(items: array<DerItem>, tag: int): DerItem? {
+    for (item in items) if (item.tag == tag) return item
+    null
+}
+
+fun lastWithTag(items: array<DerItem>, tag: int): DerItem? {
+    var found: DerItem? = null
+    for (item in items) if (item.tag == tag) found = item
+    found
+}
+
+// The number at data[at...] after spaces: its value and the position after it, or -1.
+class Number(val value: int, val next: int)
+
+fun readNumber(data: string, begin: int): Number {
+    var at = begin
+    while (at < data.size && (data[at] == 32 || data[at] == 10 || data[at] == 13 || data[at] == 9)) at = at + 1
+    var value = 0
+    var digits = 0
+    while (at < data.size && data[at] >= 48 && data[at] <= 57 && digits < 12) {
+        value = value * 10 + data[at] - 48
+        at = at + 1
+        digits = digits + 1
+    }
+    if (digits == 0) Number(-1, at) else Number(value, at)
+}
+
+fun isHexByte(byte: int): bool = (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 70) || (byte >= 97 && byte <= 102)
+
+fun main: int {
+    val data = Path(processArgument(0)).readText()
+    val prefix = processArgument(1)
+    val marker = data.indexOf("/ByteRange")
+    if (marker < 0) {
+        eprintln("no /ByteRange")
+        return 11
+    }
+    var at = data.indexOf("[", marker)
+    val numbers: array<int> = []
+    for (i in 0 until 4) {
+        val number = readNumber(data, at + 1)
+        numbers.append(number.value)
+        at = number.next - 1
+    }
+    var closing = at + 1
+    while (closing < data.size && (data[closing] == 32 || data[closing] == 10 || data[closing] == 13)) closing = closing + 1
+    val first = numbers[0]
+    val signedEnd = numbers[1]
+    val tailBegin = numbers[2]
+    val tailSize = numbers[3]
+    if (first != 0 || signedEnd <= 0 || tailBegin <= signedEnd + 2 || tailSize < 0 || tailBegin + tailSize > data.size ||
+        closing >= data.size || data[closing] != 93) {
+        eprintln("the ByteRange is not [0 a b c] inside the file: ${numbers[0]} ${numbers[1]} ${numbers[2]} ${numbers[3]}")
+        return 11
+    }
+    // Between the two ranges only the /Contents string: < hex digits >, and nothing else.
+    var gapIsContents = data[signedEnd] == 60 && data[tailBegin - 1] == 62
+    for (i in signedEnd + 1 until tailBegin - 1) if (!isHexByte(data[i])) gapIsContents = false
+    if (!gapIsContents || (tailBegin - signedEnd - 2) % 2 != 0) {
+        eprintln("the gap [$signedEnd, $tailBegin) of the ByteRange is not exactly a /Contents hex string")
+        return 11
+    }
+    val covered = data.slice(0, signedEnd) + data.slice(tailBegin, tailBegin + tailSize)
+    Path("$prefix.signed").writeText(covered)
+    val der = hexDecode(data.slice(signedEnd + 1, tailBegin - 1))
+    val outer = derItems(der, 0, der.size)
+    if (outer.size == 0 || outer[0].tag != 48) {
+        eprintln("the /Contents hole holds no DER SEQUENCE")
+        return 12
+    }
+    val cms = der.slice(0, outer[0].bodyEnd)
+    Path("$prefix.p7s").writeText(cms)
+    // ContentInfo { contentType, [0] { SignedData { ..., signerInfos SET { SignerInfo { ..., [0] signedAttrs, ..., signature } } } } }
+    val contentInfo = derItems(cms, outer[0].bodyBegin, outer[0].bodyEnd)
+    val wrapper = firstWithTag(contentInfo, 160)
+    if (wrapper == null) return 12
+    val signedData = derItems(cms, wrapper.bodyBegin, wrapper.bodyEnd)
+    if (signedData.size == 0) return 12
+    val parts = derItems(cms, signedData[0].bodyBegin, signedData[0].bodyEnd)
+    val signerInfos = lastWithTag(parts, 49)
+    if (signerInfos == null) return 12
+    val signers = derItems(cms, signerInfos.bodyBegin, signerInfos.bodyEnd)
+    if (signers.size == 0) return 12
+    val fields = derItems(cms, signers[0].bodyBegin, signers[0].bodyEnd)
+    val attributes = firstWithTag(fields, 160)
+    val signature = lastWithTag(fields, 4)
+    if (attributes == null || signature == null) return 12
+    Path("$prefix.attrs").writeText("1" + cms.slice(attributes.start + 1, attributes.bodyEnd))
+    Path("$prefix.sig").writeText(cms.slice(signature.bodyBegin, signature.bodyEnd))
+    if (tailBegin + tailSize == data.size) {
+        println("coverage: the whole file")
+        return 0
+    }
+    println("coverage: not the whole file: ${data.size - tailBegin - tailSize} bytes follow the signed ranges")
+    10
+}

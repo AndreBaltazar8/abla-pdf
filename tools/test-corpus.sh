@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# Builds the corpus of PDFs from other producers and runs the reader over it.
+# The corpus of PDFs from other producers is committed (tests/corpus/files, with where each came from in tests/corpus/README.md);
+# only hostile-many-values.pdf, 48 MB, is made here. Then the reader runs over it (make corpus).
 set -eu
-dir=${1:-tests/corpus/generated}
-font=${CORPUS_FONT:-tests/fixtures/DejaVuSans-Latin.ttf}
-nix-shell -p qpdf poppler-utils ghostscript fontconfig dejavu_fonts \
-    'python3.withPackages(p: [p.reportlab p.pycairo p.pypdf p.pillow])' \
-    --run "python3 -I tools/make-corpus.py '$dir' '$font'"
+dir=${1:-tests/corpus/files}
+if [ ! -f "$dir/hostile-many-values.pdf" ]; then bash tools/hostile-many-values.sh "$dir/hostile-many-values.pdf"; fi
 ls "$dir"/*.pdf | wc -l

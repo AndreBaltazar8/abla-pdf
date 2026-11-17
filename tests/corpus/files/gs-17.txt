@@ -1,0 +1,6 @@
+Ghostscript text page one
+Second line in Times
+
+Page two in Courier
+
+

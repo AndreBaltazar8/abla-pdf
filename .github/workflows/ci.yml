@@ -26,11 +26,12 @@ jobs:
         run: |
           ablac build examples/invoice.ab -o build/invoice
           nix-shell -p qpdf poppler-utils --run tools/check-fonts.sh
-      - name: Signatures through pdfsig, openssl and pyHanko
+      - name: Signatures through pdfsig, openssl, qpdf and the ByteRange check
         run: |
           ablac build tools/sign-file.ab -o build/sign-file
-          nix-shell -p openssl qpdf poppler-utils 'python3.withPackages(p: [p.pyhanko p.pyhanko-certvalidator])' --run tools/test-signatures.sh
-      - name: Corpus from other producers
+          ablac build tools/signature-parts.ab -o build/signature-parts
+          nix-shell -p openssl qpdf poppler-utils --run tools/test-signatures.sh
+      - name: The big hostile file for the corpus
         run: tools/test-corpus.sh
       - name: Reader over the corpus, and fuzzing
         run: ablac test tests/corpus_test.ab tests/image_test.ab tests/fuzz_test.ab

@@ -1,0 +1,41 @@
+Ghostscript text page one
+Second line in Times
+
+Page two in Courier
+
+The quick brown fox jumps over the lazy dog 0123456789
+Olá São João: ação, coração, pão, mãe, avó, você, açúcar, Évora, Açores, 100 €
+Times: São João
+
+linha numero 0 de texto
+linha numero 1 de texto
+linha numero 2 de texto
+linha numero 3 de texto
+linha numero 4 de texto
+linha numero 5 de texto
+linha numero 6 de texto
+linha numero 7 de texto
+linha numero 8 de texto
+linha numero 9 de texto
+linha numero 10 de texto
+linha numero 11 de texto
+linha numero 12 de texto
+linha numero 13 de texto
+linha numero 14 de texto
+linha numero 15 de texto
+linha numero 16 de texto
+linha numero 17 de texto
+linha numero 18 de texto
+linha numero 19 de texto
+linha numero 20 de texto
+linha numero 21 de texto
+linha numero 22 de texto
+linha numero 23 de texto
+linha numero 24 de texto
+linha numero 25 de texto
+linha numero 26 de texto
+linha numero 27 de texto
+linha numero 28 de texto
+linha numero 29 de texto
+
+

@@ -1,4 +1,4 @@
-// Runs the reader over the corpus tools/test-corpus.sh generates and compares it
+// Runs the reader over the corpus in tests/corpus/files (tools/test-corpus.sh adds the big one) and compares it
 // with what poppler and pypdf said about each file. Skipped when not generated.
 
 import "abla/test"
@@ -121,9 +121,9 @@ fun checkFile(stem: string): void {
 }
 
 fun main: int {
-    val dir = path("tests/corpus/generated")
+    val dir = path("tests/corpus/files")
     if (!dir.exists()) {
-        println("corpus not generated, skipped: run tools/test-corpus.sh")
+        println("corpus missing, skipped")
         return testsPassed()
     }
     var files = 0
