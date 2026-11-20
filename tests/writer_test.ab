@@ -6,7 +6,6 @@ import "abla/test"
 import "abla/fs"
 import "abla/text"
 import "abla/bytes"
-import "abla/process"
 import "../src/pdf.ab"
 
 val PORTUGUESE = "Olá, São João: ação, coração, pão, mãe, avó, você, à, é, ê, í, ó, ô, õ, ú, ü, ç, Á À Â Ã É Ê Í Ó Ô Õ Ú Ç €"

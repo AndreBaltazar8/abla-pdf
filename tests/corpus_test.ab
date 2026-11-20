@@ -6,7 +6,6 @@ import "abla/io"
 import "abla/fs"
 import "abla/text"
 import "abla/bytes"
-import "abla/process"
 import "../src/pdf.ab"
 
 // Lowercased words: the comparison is about content, not layout or hyphenation.

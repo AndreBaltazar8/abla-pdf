@@ -4,7 +4,6 @@
 import "abla/test"
 import "abla/io"
 import "abla/fs"
-import "abla/text"
 import "../src/pdf.ab"
 
 fun checkPng(dir: string, name: string): void {

@@ -6,7 +6,6 @@
 import "abla/test"
 import "abla/fs"
 import "abla/bytes"
-import "abla/crypto"
 import "abla/process"
 import "abla/text"
 import "../src/pdf.ab"
