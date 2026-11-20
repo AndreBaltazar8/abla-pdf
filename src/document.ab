@@ -7,7 +7,6 @@ import "writer.ab"
 import "reader.ab"
 import "abla/bytes"
 import "abla/date"
-import "abla/float"
 import "abla/text"
 
 class PdfMetadata(

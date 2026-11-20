@@ -1,8 +1,6 @@
 // A page drawn as gray pixels, for reading what it shows as a picture, such as a QR code: its filled paths of any shape and
 // its images with raw samples, each into its box. Text, strokes, clipping and JPEG or other coded images are left out.
 
-import "util.ab"
-import "reader.ab"
 import "content.ab"
 import "document.ab"
 import "abla/float"

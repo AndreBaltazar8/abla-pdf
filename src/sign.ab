@@ -10,7 +10,6 @@
 
 import "util.ab"
 import "crypt.ab"
-import "image.ab"
 import "reader.ab"
 import "document.ab"
 import "abla/bytes"
